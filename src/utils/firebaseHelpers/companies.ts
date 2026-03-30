@@ -1,15 +1,15 @@
 import { db } from "../firebase";
 import {
-    collection,
     addDoc,
-    updateDoc,
+    collection,
     deleteDoc,
     doc,
     getDocs,
     onSnapshot,
     orderBy,
     query,
-    serverTimestamp
+    serverTimestamp,
+    updateDoc
 } from "firebase/firestore";
 
 export interface Company {
@@ -23,24 +23,33 @@ export interface Company {
     createdBy: string;
 }
 
+export type LedgerType = "purchaseLedger" | "salesLedger";
+export type LedgerEntryKind = "bill" | "credit";
+
 export interface CompanyLedgerEntry {
     id?: string;
-    billId: string;
-    billType: "Purchase" | "Sale" | "Sell";
+    billId?: string;
+    billNumber?: string;
+    billType?: "Purchase" | "Sale";
+    entryKind: LedgerEntryKind;
     date: string;
     credit: number;
     debit: number;
     amount: number;
     billImageUrl?: string;
     billImagePublicId?: string;
+    billImageResourceType?: "image" | "raw" | "video";
     companyName: string;
+    gateway?: "upi" | "bank transfer" | "cheque";
+    bank?: string;
+    chequeNumber?: string;
+    note?: string;
     createdAt?: any;
     updatedAt?: any;
 }
 
 const normalizeText = (value?: string) => String(value || "").trim().toLowerCase();
 
-// Fetch Companies (Real-time listener)
 export const subscribeToCompanies = (orgId: string, callback: (items: Company[]) => void) => {
     if (!orgId) return () => { };
 
@@ -65,7 +74,7 @@ export const subscribeToCompanies = (orgId: string, callback: (items: Company[])
 export const subscribeToCompanyLedger = (
     orgId: string,
     companyId: string,
-    ledgerType: "purchaseLedger" | "salesLedger",
+    ledgerType: LedgerType,
     callback: (items: CompanyLedgerEntry[]) => void
 ) => {
     if (!orgId || !companyId) return () => { };
@@ -88,7 +97,6 @@ export const subscribeToCompanyLedger = (
     return unsubscribe;
 };
 
-// Add Company
 export const addCompanyItem = async (orgId: string, itemData: Omit<Company, "id" | "createdAt" | "updatedAt">) => {
     try {
         const parsedData = {
@@ -138,7 +146,7 @@ export const ensureCompanyProfile = async (
 export const addCompanyLedgerEntry = async (
     orgId: string,
     companyId: string,
-    ledgerType: "purchaseLedger" | "salesLedger",
+    ledgerType: LedgerType,
     entry: Omit<CompanyLedgerEntry, "id" | "createdAt" | "updatedAt">
 ) => {
     try {
@@ -157,7 +165,7 @@ export const addCompanyLedgerEntry = async (
 export const updateCompanyLedgerEntry = async (
     orgId: string,
     companyId: string,
-    ledgerType: "purchaseLedger" | "salesLedger",
+    ledgerType: LedgerType,
     entryId: string,
     updates: Partial<CompanyLedgerEntry>
 ) => {
@@ -173,7 +181,21 @@ export const updateCompanyLedgerEntry = async (
     }
 };
 
-// Update Company
+export const deleteCompanyLedgerEntry = async (
+    orgId: string,
+    companyId: string,
+    ledgerType: LedgerType,
+    entryId: string
+) => {
+    try {
+        const ledgerDocRef = doc(db, "organizations", orgId, "companies", companyId, ledgerType, entryId);
+        await deleteDoc(ledgerDocRef);
+        return { success: true, error: null };
+    } catch (error: any) {
+        return { success: false, error: error.message };
+    }
+};
+
 export const updateCompanyItem = async (orgId: string, itemId: string, updatedData: Partial<Company>) => {
     try {
         const docRef = doc(db, "organizations", orgId, "companies", itemId);
@@ -187,7 +209,6 @@ export const updateCompanyItem = async (orgId: string, itemId: string, updatedDa
     }
 };
 
-// Delete Company
 export const deleteCompanyItem = async (orgId: string, itemId: string) => {
     try {
         const docRef = doc(db, "organizations", orgId, "companies", itemId);

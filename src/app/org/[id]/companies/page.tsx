@@ -1,441 +1,248 @@
 "use client";
 
-import React, { useState, useEffect } from "react";
+import React, { useEffect, useMemo, useState } from "react";
+import { Building2, CreditCard, FileText, Plus, Search, X } from "lucide-react";
 import { useAuth } from "@/context/AuthContext";
 import { useOrg } from "@/context/OrgContext";
-import { Plus, Building2, X, Edit, Trash2, FileText } from "lucide-react";
 import {
+    addCompanyItem,
+    addCompanyLedgerEntry,
     Company,
     CompanyLedgerEntry,
+    deleteCompanyItem,
     subscribeToCompanies,
     subscribeToCompanyLedger,
-    addCompanyItem,
-    updateCompanyItem,
-    deleteCompanyItem
+    updateCompanyItem
 } from "@/utils/firebaseHelpers/companies";
+import { formatCurrencyINR } from "@/utils/formatters";
 
-export default function CompaniesView({ params }: { params: Promise<{ id: string }> }) {
+const emptyCompany = { name: "", gst: "", address: "", phoneNumbers: "" };
+const emptyCredit = { gateway: "upi", amount: "", date: new Date().toISOString().split("T")[0], bank: "", chequeNumber: "", note: "" };
+
+export default function CompaniesPage() {
     const { user } = useAuth();
     const { activeOrg } = useOrg();
-
     const [companies, setCompanies] = useState<Company[]>([]);
-    const [loading, setLoading] = useState(true);
-
-    // List Control States
-    const [searchQuery, setSearchQuery] = useState("");
-    const [sortParam, setSortParam] = useState("Name (A-Z)");
-
-    // Modal states
-    const [showModal, setShowModal] = useState(false);
-    const [editingId, setEditingId] = useState<string | null>(null);
-    const [showLedgerModal, setShowLedgerModal] = useState(false);
-    const [selectedCompany, setSelectedCompany] = useState<Company | null>(null);
+    const [selectedCompanyId, setSelectedCompanyId] = useState<string | null>(null);
     const [purchaseLedger, setPurchaseLedger] = useState<CompanyLedgerEntry[]>([]);
     const [salesLedger, setSalesLedger] = useState<CompanyLedgerEntry[]>([]);
-    const [formData, setFormData] = useState({
-        name: "",
-        gst: "",
-        address: "",
-        phoneNumbers: ""
-    });
-    const [actionLoading, setActionLoading] = useState(false);
+    const [activeTab, setActiveTab] = useState<"purchaseLedger" | "salesLedger">("purchaseLedger");
+    const [query, setQuery] = useState("");
+    const [loading, setLoading] = useState(true);
+    const [showCompanyModal, setShowCompanyModal] = useState(false);
+    const [editingCompanyId, setEditingCompanyId] = useState<string | null>(null);
+    const [companyForm, setCompanyForm] = useState(emptyCompany);
+    const [showCreditModal, setShowCreditModal] = useState(false);
+    const [creditForm, setCreditForm] = useState(emptyCredit);
     const [error, setError] = useState("");
 
-    // Unseal params
-    const resolvedParams = React.use(params);
-
     useEffect(() => {
-        if (!user || !activeOrg || activeOrg.orgId !== resolvedParams.id) return;
-
+        if (!activeOrg || !user) return;
         const unsubscribe = subscribeToCompanies(activeOrg.orgId, (items) => {
             setCompanies(items);
             setLoading(false);
+            if (!selectedCompanyId && items[0]?.id) setSelectedCompanyId(items[0].id);
         });
-
         return () => unsubscribe();
-    }, [user, activeOrg, resolvedParams.id]);
+    }, [activeOrg, user, selectedCompanyId]);
 
     useEffect(() => {
-        if (!activeOrg || !selectedCompany?.id || !showLedgerModal) return;
+        if (!activeOrg || !selectedCompanyId) return;
+        const unsubPurchase = subscribeToCompanyLedger(activeOrg.orgId, selectedCompanyId, "purchaseLedger", setPurchaseLedger);
+        const unsubSales = subscribeToCompanyLedger(activeOrg.orgId, selectedCompanyId, "salesLedger", setSalesLedger);
+        return () => { unsubPurchase(); unsubSales(); };
+    }, [activeOrg, selectedCompanyId]);
 
-        const unsubscribePurchase = subscribeToCompanyLedger(
-            activeOrg.orgId,
-            selectedCompany.id,
-            "purchaseLedger",
-            setPurchaseLedger
-        );
-        const unsubscribeSales = subscribeToCompanyLedger(
-            activeOrg.orgId,
-            selectedCompany.id,
-            "salesLedger",
-            setSalesLedger
-        );
+    const selectedCompany = useMemo(() => companies.find((company) => company.id === selectedCompanyId) || companies[0] || null, [companies, selectedCompanyId]);
+    const ledgerRows = activeTab === "purchaseLedger" ? purchaseLedger : salesLedger;
+    const filteredCompanies = useMemo(() => companies.filter((company) => {
+        const q = query.toLowerCase();
+        if (!q) return true;
+        return company.name.toLowerCase().includes(q) || (company.gst || "").toLowerCase().includes(q);
+    }), [companies, query]);
 
-        return () => {
-            unsubscribePurchase();
-            unsubscribeSales();
-        };
-    }, [activeOrg, selectedCompany, showLedgerModal]);
-
-    const handleOpenModal = (company?: Company) => {
-        if (company) {
-            setEditingId(company.id as string);
-            setFormData({
-                name: company.name,
-                gst: company.gst,
-                address: company.address,
-                phoneNumbers: company.phoneNumbers
-            });
-        } else {
-            setEditingId(null);
-            setFormData({
-                name: "",
-                gst: "",
-                address: "",
-                phoneNumbers: ""
-            });
-        }
+    const openCompanyModal = (company?: Company) => {
+        setEditingCompanyId(company?.id || null);
+        setCompanyForm(company ? { name: company.name, gst: company.gst, address: company.address, phoneNumbers: company.phoneNumbers } : emptyCompany);
+        setShowCompanyModal(true);
         setError("");
-        setShowModal(true);
     };
 
-    const handleSubmit = async (e: React.FormEvent) => {
-        e.preventDefault();
-        setError("");
-        setActionLoading(true);
-
+    const saveCompany = async (event: React.FormEvent) => {
+        event.preventDefault();
         if (!activeOrg || !user) return;
-
-        if (editingId) {
-            const { error: updateError } = await updateCompanyItem(activeOrg.orgId, editingId, formData);
-            if (updateError) {
-                setError(updateError);
-                setActionLoading(false);
-                return;
-            }
-        } else {
-            const { error: addError } = await addCompanyItem(activeOrg.orgId, {
-                ...formData,
-                createdBy: user.uid
-            });
-            if (addError) {
-                setError(addError);
-                setActionLoading(false);
-                return;
-            }
+        setError("");
+        if (editingCompanyId) {
+            const result = await updateCompanyItem(activeOrg.orgId, editingCompanyId, companyForm);
+            if (result.error) setError(result.error);
+            else setShowCompanyModal(false);
+            return;
         }
-
-        setShowModal(false);
-        setActionLoading(false);
+        const result = await addCompanyItem(activeOrg.orgId, { ...companyForm, createdBy: user.uid });
+        if (result.error) setError(result.error);
+        else setShowCompanyModal(false);
     };
 
-    const handleDelete = async (id: string, name: string) => {
-        if (!activeOrg) return;
-        if (window.confirm(`Are you sure you want to delete ${name}?`)) {
-            await deleteCompanyItem(activeOrg.orgId, id);
-        }
-    };
-
-    const handleOpenLedger = (company: Company) => {
-        setSelectedCompany(company);
-        setShowLedgerModal(true);
-    };
-
-    // Filter and Sort Logic
-    const filteredAndSortedCompanies = [...companies]
-        .filter(comp => {
-            if (!searchQuery) return true;
-            const q = searchQuery.toLowerCase();
-            return (
-                comp.name.toLowerCase().includes(q) ||
-                (comp.gst && comp.gst.toLowerCase().includes(q)) ||
-                (comp.id && comp.id.toLowerCase().includes(q))
-            );
-        })
-        .sort((a, b) => {
-            switch (sortParam) {
-                case "Name (A-Z)":
-                    return a.name.localeCompare(b.name);
-                case "Name (Z-A)":
-                    return b.name.localeCompare(a.name);
-                case "Default":
-                default:
-                    return 0; // maintain insertion order / created date since subscribe orders by it
-            }
+    const addCredit = async (event: React.FormEvent) => {
+        event.preventDefault();
+        if (!activeOrg || !selectedCompany || !selectedCompany.id) return;
+        const targetLedger = activeTab === "purchaseLedger" ? "purchaseLedger" : "salesLedger";
+        const amount = Number(creditForm.amount || 0);
+        const result = await addCompanyLedgerEntry(activeOrg.orgId, selectedCompany.id, targetLedger, {
+            entryKind: "credit",
+            billNumber: "",
+            date: creditForm.date,
+            credit: targetLedger === "salesLedger" ? amount : 0,
+            debit: targetLedger === "purchaseLedger" ? amount : 0,
+            amount,
+            companyName: selectedCompany.name,
+            gateway: creditForm.gateway as "upi" | "bank transfer" | "cheque",
+            bank: creditForm.bank,
+            chequeNumber: creditForm.gateway === "cheque" ? creditForm.chequeNumber : "",
+            note: creditForm.note
         });
+        if (result.error) {
+            setError(result.error);
+            return;
+        }
+        setShowCreditModal(false);
+        setCreditForm(emptyCredit);
+    };
 
     return (
         <div>
             <header className="dashboard-header flex-between" style={{ marginTop: 0 }}>
                 <div>
-                    <h1 className="dashboard-title">Companies Directory</h1>
-                    <p className="dashboard-subtitle">Manage your connections, suppliers, and buyers.</p>
+                    <p className="section-kicker">Companies Workspace</p>
+                    <h1 className="dashboard-title">Companies</h1>
+                    <p className="dashboard-subtitle">Browse companies on the left and manage the selected ledger on the right.</p>
                 </div>
-                <div>
-                    <button onClick={() => handleOpenModal()} className="btn-primary" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                        <Plus size={18} /> Add Company
-                    </button>
-                </div>
+                <button className="btn-primary" onClick={() => openCompanyModal()}><Plus size={18} style={{ marginRight: "8px" }} /> Add Company</button>
             </header>
 
-            <div className="flex-between" style={{ marginBottom: '16px', gap: '16px', marginTop: '24px' }}>
-                <div style={{ flex: 1, position: 'relative' }}>
-                    <input
-                        type="text"
-                        placeholder="Search by Name, ID, or GST..."
-                        value={searchQuery}
-                        onChange={(e) => setSearchQuery(e.target.value)}
-                        style={{
-                            width: '100%',
-                            maxWidth: '400px',
-                            padding: '10px 16px',
-                            borderRadius: '8px',
-                            border: '1px solid var(--border-color)',
-                            background: 'var(--surface-color)',
-                            color: 'var(--text-color)'
-                        }}
-                    />
-                </div>
-                <div>
-                    <select
-                        value={sortParam}
-                        onChange={(e) => setSortParam(e.target.value)}
-                        style={{
-                            padding: '10px 16px',
-                            borderRadius: '8px',
-                            border: '1px solid var(--border-color)',
-                            background: 'var(--surface-color)',
-                            color: 'var(--text-color)',
-                            cursor: 'pointer'
-                        }}
-                    >
-                        <option value="Default">Sort By...</option>
-                        <option value="Name (A-Z)">Name (A-Z)</option>
-                        <option value="Name (Z-A)">Name (Z-A)</option>
-                    </select>
-                </div>
+            {error && <div className="error-banner" style={{ marginBottom: "16px" }}>{error}</div>}
+
+            <div className="workspace-grid">
+                <section className="glass-panel" style={{ padding: 0, overflow: "hidden" }}>
+                    <div style={{ padding: "18px", borderBottom: "1px solid var(--border-color)" }}>
+                        <div className="search-box">
+                            <Search size={16} />
+                            <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search company name or GST..." />
+                        </div>
+                    </div>
+                    <div style={{ maxHeight: "72vh", overflowY: "auto" }}>
+                        {loading ? <div style={{ padding: "24px" }}>Loading companies...</div> : filteredCompanies.length === 0 ? <div style={{ padding: "24px", opacity: 0.7 }}>No companies found.</div> : filteredCompanies.map((company) => (
+                            <button key={company.id} type="button" className={`workspace-list-row ${selectedCompany?.id === company.id ? "active" : ""}`} onClick={() => setSelectedCompanyId(company.id || null)}>
+                                <div>
+                                    <div style={{ fontWeight: 700 }}>{company.name}</div>
+                                    <div style={{ opacity: 0.76 }}>{company.gst || "No GST recorded"}</div>
+                                </div>
+                                <Building2 size={18} />
+                            </button>
+                        ))}
+                    </div>
+                </section>
+
+                <section className="glass-panel workspace-detail-panel">
+                    {selectedCompany ? (
+                        <div>
+                            <div className="section-header-row" style={{ marginBottom: "18px" }}>
+                                <div>
+                                    <p className="section-kicker">Selected Company</p>
+                                    <h2 className="section-title">{selectedCompany.name}</h2>
+                                    <p style={{ opacity: 0.72 }}>{selectedCompany.address || "No address recorded"}</p>
+                                </div>
+                                <div style={{ display: "flex", gap: "10px" }}>
+                                    <button className="btn-secondary" onClick={() => openCompanyModal(selectedCompany)}><FileText size={16} style={{ marginRight: "8px" }} /> Edit</button>
+                                    <button className="btn-secondary" onClick={() => setShowCreditModal(true)}><CreditCard size={16} style={{ marginRight: "8px" }} /> Register Credit</button>
+                                </div>
+                            </div>
+
+                            <div className="company-tabs">
+                                <button className={`company-tab ${activeTab === "purchaseLedger" ? "active" : ""}`} onClick={() => setActiveTab("purchaseLedger")}>Purchase</button>
+                                <button className={`company-tab ${activeTab === "salesLedger" ? "active" : ""}`} onClick={() => setActiveTab("salesLedger")}>Sales</button>
+                            </div>
+
+                            <div className="bill-section">
+                                <div className="detail-pair-grid">
+                                    <div><span className="detail-label">GST</span><strong>{selectedCompany.gst || "-"}</strong></div>
+                                    <div><span className="detail-label">Phone</span><strong>{selectedCompany.phoneNumbers || "-"}</strong></div>
+                                </div>
+                            </div>
+
+                            <div className="bill-section" style={{ padding: 0, overflow: "hidden" }}>
+                                <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                                    <thead style={{ background: "var(--border-color)" }}>
+                                        <tr>
+                                            {["Date", "Bill Number", "Debit", "Credit", "Amount", "Gateway"].map((label) => <th key={label} style={{ padding: "14px 16px", textAlign: "left" }}>{label}</th>)}
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {ledgerRows.length === 0 ? (
+                                            <tr><td colSpan={6} style={{ padding: "24px 16px", opacity: 0.7 }}>No {activeTab === "purchaseLedger" ? "purchase" : "sales"} entries yet.</td></tr>
+                                        ) : ledgerRows.map((entry) => (
+                                            <tr key={entry.id} style={{ borderBottom: "1px solid var(--border-color)" }}>
+                                                <td style={{ padding: "14px 16px" }}>{entry.date}</td>
+                                                <td style={{ padding: "14px 16px" }}>
+                                                    {entry.billImagePublicId || entry.billImageUrl ? (
+                                                        <a className="inline-link" href={entry.billImagePublicId ? `/api/bills/file?publicId=${encodeURIComponent(entry.billImagePublicId)}&resourceType=${encodeURIComponent(entry.billImageResourceType || "image")}` : entry.billImageUrl} target="_blank" rel="noreferrer">
+                                                            {entry.billNumber || "View Bill"}
+                                                        </a>
+                                                    ) : (
+                                                        entry.billNumber || "-"
+                                                    )}
+                                                </td>
+                                                <td style={{ padding: "14px 16px" }}>{formatCurrencyINR(entry.debit)}</td>
+                                                <td style={{ padding: "14px 16px" }}>{formatCurrencyINR(entry.credit)}</td>
+                                                <td style={{ padding: "14px 16px", fontWeight: 700 }}>{formatCurrencyINR(entry.amount)}</td>
+                                                <td style={{ padding: "14px 16px" }}>{entry.gateway || (entry.entryKind === "bill" ? "Bill" : "-")}</td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    ) : (
+                        <div className="empty-state-panel"><Building2 size={28} /><h2>No company selected</h2><p>Select a company from the list to open its ledgers.</p></div>
+                    )}
+                </section>
             </div>
 
-            <div className="glass-panel" style={{ padding: 0, overflow: 'hidden' }}>
-                <div style={{ overflowX: 'auto' }}>
-                    <table style={{ minWidth: '800px', width: '100%', borderCollapse: 'collapse', textAlign: 'left' }}>
-                        <thead style={{ background: 'var(--border-color)' }}>
-                            <tr>
-                                <th style={{ padding: '16px 24px', fontWeight: 500, fontSize: '0.875rem', opacity: 0.7 }}>Company ID</th>
-                                <th style={{ padding: '16px 24px', fontWeight: 500, fontSize: '0.875rem', opacity: 0.7 }}>Name</th>
-                                <th style={{ padding: '16px 24px', fontWeight: 500, fontSize: '0.875rem', opacity: 0.7 }}>GST Number</th>
-                                <th style={{ padding: '16px 24px', fontWeight: 500, fontSize: '0.875rem', opacity: 0.7 }}>Phone</th>
-                                <th style={{ padding: '16px 24px', fontWeight: 500, fontSize: '0.875rem', opacity: 0.7 }}>Address</th>
-                                <th style={{ padding: '16px 24px', fontWeight: 500, fontSize: '0.875rem', opacity: 0.7, textAlign: 'right' }}>Actions</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {loading ? (
-                                <tr><td colSpan={6} style={{ padding: '24px', textAlign: 'center' }}>Loading...</td></tr>
-                            ) : filteredAndSortedCompanies.length === 0 ? (
-                                <tr><td colSpan={6} style={{ padding: '48px', textAlign: 'center', opacity: 0.6 }}>No companies found. Click "Add Company" to get started.</td></tr>
-                            ) : (
-                                filteredAndSortedCompanies.map((comp, i) => (
-                                    <tr key={comp.id} style={{ borderBottom: i < filteredAndSortedCompanies.length - 1 ? '1px solid var(--border-color)' : 'none', transition: 'var(--transition)' }} className="table-row-hover">
-                                        <td style={{ padding: '16px 24px', fontFamily: 'var(--font-geist-mono)', fontSize: '0.875rem', opacity: 0.8 }}>
-                                            {comp.id}
-                                        </td>
-                                        <td style={{ padding: '16px 24px', fontWeight: 500 }}>
-                                            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                                                <Building2 size={16} style={{ opacity: 0.5 }} />
-                                                {comp.name}
-                                            </div>
-                                        </td>
-                                        <td style={{ padding: '16px 24px', fontFamily: 'var(--font-geist-mono)' }}>{comp.gst || '-'}</td>
-                                        <td style={{ padding: '16px 24px' }}>{comp.phoneNumbers || '-'}</td>
-                                        <td style={{ padding: '16px 24px', maxWidth: '300px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} title={comp.address}>
-                                            {comp.address || '-'}
-                                        </td>
-                                        <td style={{ padding: '16px 24px', textAlign: 'right' }}>
-                                            <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
-                                                <button onClick={() => handleOpenLedger(comp)} className="btn-secondary" style={{ padding: '6px' }} title="View Ledger">
-                                                    <FileText size={16} />
-                                                </button>
-                                                <button onClick={() => handleOpenModal(comp)} className="btn-secondary" style={{ padding: '6px' }} title="Edit">
-                                                    <Edit size={16} />
-                                                </button>
-                                                <button onClick={() => handleDelete(comp.id as string, comp.name)} className="btn-secondary" style={{ padding: '6px', color: '#ef4444' }} title="Delete">
-                                                    <Trash2 size={16} />
-                                                </button>
-                                            </div>
-                                        </td>
-                                    </tr>
-                                ))
-                            )}
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-
-            {/* Add / Edit Modal */}
-            {showModal && (
-                <div style={{
-                    position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
-                    background: 'rgba(0,0,0,0.5)', zIndex: 100,
-                    display: 'flex', alignItems: 'center', justifyContent: 'center',
-                    padding: '20px'
-                }}>
-                    <div className="glass-panel" style={{ width: '100%', maxWidth: '500px', position: 'relative' }}>
-                        <button
-                            onClick={() => setShowModal(false)}
-                            style={{ position: 'absolute', top: '24px', right: '24px', background: 'none', border: 'none', color: 'var(--text-color)', cursor: 'pointer', opacity: 0.7 }}
-                        >
-                            <X size={20} />
-                        </button>
-
-                        <h2 style={{ fontSize: '1.25rem', marginBottom: '24px' }}>{editingId ? 'Edit Company' : 'Add New Company'}</h2>
-
-                        {error && <div style={{ background: 'rgba(239, 68, 68, 0.1)', color: '#ef4444', padding: '12px', borderRadius: '8px', marginBottom: '16px', fontSize: '0.875rem' }}>{error}</div>}
-
-                        <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-                            <div>
-                                <label style={{ display: 'block', marginBottom: '8px', fontSize: '0.875rem', fontWeight: 500 }}>Company Name*</label>
-                                <input
-                                    required
-                                    type="text"
-                                    value={formData.name}
-                                    onChange={e => setFormData({ ...formData, name: e.target.value })}
-                                    style={{ width: '100%', padding: '10px 16px', borderRadius: '8px', border: '1px solid var(--border-color)', background: 'var(--surface-color)', color: 'var(--text-color)' }}
-                                    placeholder="e.g. Acme Corp"
-                                />
-                            </div>
-
-                            <div>
-                                <label style={{ display: 'block', marginBottom: '8px', fontSize: '0.875rem', fontWeight: 500 }}>GST Number</label>
-                                <input
-                                    type="text"
-                                    value={formData.gst}
-                                    onChange={e => setFormData({ ...formData, gst: e.target.value })}
-                                    style={{ width: '100%', padding: '10px 16px', borderRadius: '8px', border: '1px solid var(--border-color)', background: 'var(--surface-color)', color: 'var(--text-color)', fontFamily: 'var(--font-geist-mono)' }}
-                                    placeholder="Optional"
-                                />
-                            </div>
-
-                            <div>
-                                <label style={{ display: 'block', marginBottom: '8px', fontSize: '0.875rem', fontWeight: 500 }}>Phone Number(s)</label>
-                                <input
-                                    type="text"
-                                    value={formData.phoneNumbers}
-                                    onChange={e => setFormData({ ...formData, phoneNumbers: e.target.value })}
-                                    style={{ width: '100%', padding: '10px 16px', borderRadius: '8px', border: '1px solid var(--border-color)', background: 'var(--surface-color)', color: 'var(--text-color)' }}
-                                    placeholder="+1 234 567 8900"
-                                />
-                            </div>
-
-                            <div>
-                                <label style={{ display: 'block', marginBottom: '8px', fontSize: '0.875rem', fontWeight: 500 }}>Address</label>
-                                <textarea
-                                    value={formData.address}
-                                    onChange={e => setFormData({ ...formData, address: e.target.value })}
-                                    style={{ width: '100%', padding: '10px 16px', borderRadius: '8px', border: '1px solid var(--border-color)', background: 'var(--surface-color)', color: 'var(--text-color)', minHeight: '80px', resize: 'vertical' }}
-                                    placeholder="Full address details..."
-                                />
-                            </div>
-
-                            <div style={{ marginTop: '8px', display: 'flex', gap: '12px' }}>
-                                <button type="button" onClick={() => setShowModal(false)} className="btn-secondary" style={{ flex: 1 }}>
-                                    Cancel
-                                </button>
-                                <button type="submit" disabled={actionLoading} className="btn-primary" style={{ flex: 1, display: 'flex', justifyContent: 'center' }}>
-                                    {actionLoading ? 'Saving...' : 'Save Company'}
-                                </button>
-                            </div>
+            {showCompanyModal && (
+                <div className="overlay-panel">
+                    <div className="glass-panel" style={{ width: "100%", maxWidth: "520px", position: "relative" }}>
+                        <button className="panel-close" onClick={() => setShowCompanyModal(false)}>&times;</button>
+                        <h2 style={{ marginBottom: "18px" }}>{editingCompanyId ? "Edit Company" : "Add Company"}</h2>
+                        <form onSubmit={saveCompany} style={{ display: "grid", gap: "14px" }}>
+                            <input className="input-field" placeholder="Company Name" value={companyForm.name} onChange={(e) => setCompanyForm({ ...companyForm, name: e.target.value })} required />
+                            <input className="input-field" placeholder="GST" value={companyForm.gst} onChange={(e) => setCompanyForm({ ...companyForm, gst: e.target.value })} />
+                            <input className="input-field" placeholder="Phone" value={companyForm.phoneNumbers} onChange={(e) => setCompanyForm({ ...companyForm, phoneNumbers: e.target.value })} />
+                            <textarea className="input-field" placeholder="Address" value={companyForm.address} onChange={(e) => setCompanyForm({ ...companyForm, address: e.target.value })} />
+                            <button className="btn-primary">{editingCompanyId ? "Update Company" : "Save Company"}</button>
+                            {editingCompanyId && selectedCompany && <button type="button" className="btn-secondary" onClick={() => deleteCompanyItem(activeOrg!.orgId, selectedCompany.id as string)}>Delete Company</button>}
                         </form>
                     </div>
                 </div>
             )}
 
-            {showLedgerModal && selectedCompany && (
-                <div style={{
-                    position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
-                    background: 'rgba(0,0,0,0.6)', zIndex: 120,
-                    display: 'flex', alignItems: 'center', justifyContent: 'center',
-                    padding: '20px'
-                }}>
-                    <div className="glass-panel" style={{ width: '100%', maxWidth: '1000px', maxHeight: '90vh', overflowY: 'auto', position: 'relative' }}>
-                        <button
-                            onClick={() => setShowLedgerModal(false)}
-                            style={{ position: 'absolute', top: '24px', right: '24px', background: 'none', border: 'none', color: 'var(--text-color)', cursor: 'pointer', opacity: 0.7 }}
-                        >
-                            <X size={20} />
-                        </button>
-
-                        <h2 style={{ fontSize: '1.25rem', marginBottom: '8px' }}>{selectedCompany.name}</h2>
-                        <p style={{ opacity: 0.7, marginBottom: '24px' }}>
-                            Purchase and sales ledger entries for this company profile.
-                        </p>
-
-                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '12px', marginBottom: '24px' }}>
-                            <div className="glass-panel" style={{ padding: '16px' }}>
-                                <div style={{ opacity: 0.7, marginBottom: '6px', fontSize: '0.875rem' }}>Purchase Entries</div>
-                                <div style={{ fontSize: '1.5rem', fontWeight: 700 }}>{purchaseLedger.length}</div>
-                            </div>
-                            <div className="glass-panel" style={{ padding: '16px' }}>
-                                <div style={{ opacity: 0.7, marginBottom: '6px', fontSize: '0.875rem' }}>Sales Entries</div>
-                                <div style={{ fontSize: '1.5rem', fontWeight: 700 }}>{salesLedger.length}</div>
-                            </div>
-                        </div>
-
-                        {[
-                            { title: "Purchase Ledger", items: purchaseLedger },
-                            { title: "Sales Ledger", items: salesLedger }
-                        ].map((section) => (
-                            <div key={section.title} style={{ marginBottom: '24px' }}>
-                                <h3 style={{ fontSize: '1rem', marginBottom: '12px' }}>{section.title}</h3>
-                                <div style={{ overflowX: 'auto' }}>
-                                    <table style={{ width: '100%', minWidth: '700px', borderCollapse: 'collapse', textAlign: 'left' }}>
-                                        <thead style={{ background: 'var(--border-color)' }}>
-                                            <tr>
-                                                <th style={{ padding: '12px 16px' }}>Date</th>
-                                                <th style={{ padding: '12px 16px' }}>Debit</th>
-                                                <th style={{ padding: '12px 16px' }}>Credit</th>
-                                                <th style={{ padding: '12px 16px' }}>Amount</th>
-                                                <th style={{ padding: '12px 16px' }}>Bill Image</th>
-                                            </tr>
-                                        </thead>
-                                        <tbody>
-                                            {section.items.length === 0 ? (
-                                                <tr>
-                                                    <td colSpan={5} style={{ padding: '20px 16px', opacity: 0.7 }}>
-                                                        No entries logged yet.
-                                                    </td>
-                                                </tr>
-                                            ) : (
-                                                section.items.map((entry) => (
-                                                    <tr key={entry.id} style={{ borderBottom: '1px solid var(--border-color)' }}>
-                                                        <td style={{ padding: '12px 16px' }}>{entry.date || "-"}</td>
-                                                        <td style={{ padding: '12px 16px' }}>{Number(entry.debit || 0).toFixed(2)}</td>
-                                                        <td style={{ padding: '12px 16px' }}>{Number(entry.credit || 0).toFixed(2)}</td>
-                                                        <td style={{ padding: '12px 16px' }}>{Number(entry.amount || 0).toFixed(2)}</td>
-                                                        <td style={{ padding: '12px 16px' }}>
-                                                            {entry.billImagePublicId || entry.billImageUrl ? (
-                                                                <a
-                                                                    href={entry.billImagePublicId
-                                                                        ? `/api/bills/image?publicId=${encodeURIComponent(entry.billImagePublicId)}`
-                                                                        : entry.billImageUrl}
-                                                                    target="_blank"
-                                                                    rel="noreferrer"
-                                                                    style={{ color: 'var(--accent-color, #38bdf8)' }}
-                                                                >
-                                                                    View Bill
-                                                                </a>
-                                                            ) : (
-                                                                "-"
-                                                            )}
-                                                        </td>
-                                                    </tr>
-                                                ))
-                                            )}
-                                        </tbody>
-                                    </table>
-                                </div>
-                            </div>
-                        ))}
+            {showCreditModal && selectedCompany && (
+                <div className="overlay-panel">
+                    <div className="glass-panel" style={{ width: "100%", maxWidth: "520px", position: "relative" }}>
+                        <button className="panel-close" onClick={() => setShowCreditModal(false)}>&times;</button>
+                        <h2 style={{ marginBottom: "18px" }}>Register Credit for {selectedCompany.name}</h2>
+                        <form onSubmit={addCredit} style={{ display: "grid", gap: "14px" }}>
+                            <select className="input-field" value={creditForm.gateway} onChange={(e) => setCreditForm({ ...creditForm, gateway: e.target.value })}>
+                                <option value="upi">UPI</option>
+                                <option value="bank transfer">Bank Transfer</option>
+                                <option value="cheque">Cheque</option>
+                            </select>
+                            <input className="input-field" type="number" placeholder="Amount" value={creditForm.amount} onChange={(e) => setCreditForm({ ...creditForm, amount: e.target.value })} required />
+                            <input className="input-field" type="date" value={creditForm.date} onChange={(e) => setCreditForm({ ...creditForm, date: e.target.value })} required />
+                            <input className="input-field" placeholder="Bank" value={creditForm.bank} onChange={(e) => setCreditForm({ ...creditForm, bank: e.target.value })} />
+                            {creditForm.gateway === "cheque" && <input className="input-field" placeholder="Cheque Number" value={creditForm.chequeNumber} onChange={(e) => setCreditForm({ ...creditForm, chequeNumber: e.target.value })} />}
+                            <textarea className="input-field" placeholder="Note" value={creditForm.note} onChange={(e) => setCreditForm({ ...creditForm, note: e.target.value })} />
+                            <button className="btn-primary">Save Credit Entry</button>
+                        </form>
                     </div>
                 </div>
             )}

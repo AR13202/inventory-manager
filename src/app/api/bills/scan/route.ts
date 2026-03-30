@@ -22,6 +22,7 @@ Use this exact schema:
     "phoneNumbers": "customer phone if visible, else empty string"
   },
   "date": "YYYY-MM-DD if visible, else empty string",
+  "billNumber": "invoice or bill number if visible, else empty string",
   "billType": "Purchase or Sale or Unknown",
   "taxAmount": 0,
   "taxPercentage": 0,
@@ -40,6 +41,7 @@ Use this exact schema:
       "name": "item name",
       "hsn": "hsn or empty string",
       "quantity": 1,
+      "unit": "pcs/kg/box/etc or empty string",
       "price": 0,
       "category": "Trade"
     }
@@ -48,6 +50,8 @@ Use this exact schema:
 
 Rules:
 - Prefer details from the billed to section for customerCompanyDetails.
+- Extract invoice number / bill number / voucher number into billNumber.
+- Extract the quantity unit whenever visible.
 - Use numeric values for quantity, price, taxAmount, taxPercentage, freightAndForwardingCharges, roundOff, and totalAmount.
 - billType should be "Sale" when the document clearly looks like a sales invoice issued to a customer, "Purchase" when it clearly looks like a supplier bill or purchase invoice received by the uploader, otherwise "Unknown".
 - If a field is not visible, keep it empty or 0.

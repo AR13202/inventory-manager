@@ -17,23 +17,28 @@ export async function POST(request: Request) {
             return NextResponse.json({ success: false, error: "Cloudinary is not configured." }, { status: 500 });
         }
 
-        const { image } = await request.json();
-        if (!image) {
-            return NextResponse.json({ success: false, error: "No image provided." }, { status: 400 });
+        const { file, fileName, mimeType } = await request.json();
+        if (!file) {
+            return NextResponse.json({ success: false, error: "No file provided." }, { status: 400 });
         }
 
-        const uploadResponse = await cloudinary.uploader.upload(image, {
+        const isPdf = String(mimeType || "").includes("pdf");
+        const resourceType = isPdf ? "raw" : "image";
+        const uploadResponse = await cloudinary.uploader.upload(file, {
             folder: "inventory_bills",
-            resource_type: "image",
+            resource_type: resourceType,
             type: "authenticated",
             overwrite: false,
-            invalidate: true
+            invalidate: true,
+            use_filename: true,
+            filename_override: fileName || undefined
         });
 
         return NextResponse.json({
             success: true,
-            url: `/api/bills/image?publicId=${encodeURIComponent(uploadResponse.public_id)}`,
-            publicId: uploadResponse.public_id
+            publicId: uploadResponse.public_id,
+            resourceType: uploadResponse.resource_type,
+            url: `/api/bills/file?publicId=${encodeURIComponent(uploadResponse.public_id)}&resourceType=${encodeURIComponent(uploadResponse.resource_type)}`
         });
     } catch (error: any) {
         console.error("Cloudinary upload error:", error);

@@ -13,6 +13,7 @@ export interface ScannedReceiptData {
         phoneNumbers?: string;
     };
     date?: string;
+    billNumber?: string;
     billType?: "Purchase" | "Sale" | "Unknown";
     taxAmount?: number;
     taxPercentage?: number;
@@ -27,6 +28,7 @@ export interface ScannedReceiptData {
     items?: {
         name?: string;
         quantity?: number;
+        unit?: string;
         hsn?: string;
         price?: number;
         category?: string;

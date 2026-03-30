@@ -1,823 +1,574 @@
 "use client";
 
-import React, { useState, useEffect, useRef } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { useSearchParams } from "next/navigation";
+import { Edit, FileText, Plus, Search, Trash2, Upload, X } from "lucide-react";
 import { useAuth } from "@/context/AuthContext";
 import { useOrg } from "@/context/OrgContext";
-import { Plus, Search, FileText, X, Edit, Trash2, Camera, Upload } from "lucide-react";
-import {
-    BillItem,
-    subscribeToBills,
-    addBillItem,
-    updateBillItem,
-    deleteBillItem
-} from "@/utils/firebaseHelpers/bills";
-import { syncInventoryFromBill, subscribeToInventory, InventoryItem } from "@/utils/firebaseHelpers/inventory";
-import { addCompanyLedgerEntry, ensureCompanyProfile, updateCompanyLedgerEntry } from "@/utils/firebaseHelpers/companies";
+import { addBillItem, BillItem, deleteBillItem, subscribeToBills, updateBillItem } from "@/utils/firebaseHelpers/bills";
+import { addCompanyLedgerEntry, CompanyLedgerEntry, deleteCompanyLedgerEntry, ensureCompanyProfile, updateCompanyLedgerEntry } from "@/utils/firebaseHelpers/companies";
+import { InventoryItem, reconcileInventoryForBillUpdate, subscribeToInventory, syncInventoryFromBill } from "@/utils/firebaseHelpers/inventory";
+import { createBillNumber, getBillAssetUrl, normalizeBillType, sanitizeBillNumber } from "@/utils/billHelpers";
+import { formatCurrencyINR } from "@/utils/formatters";
 import { scanReceipt } from "@/utils/geminiScanner";
 
-const normalizeBillType = (billType?: string): "Purchase" | "Sale" => {
-    return billType === "Sale" || billType === "Sell" ? "Sale" : "Purchase";
+type FormState = Partial<BillItem> & { vendorGst?: string; vendorAddress?: string; vendorPhone?: string };
+
+const emptyForm = (): FormState => ({
+    billNumber: "",
+    vendorName: "",
+    vendorGst: "",
+    vendorAddress: "",
+    vendorPhone: "",
+    billType: "Purchase",
+    date: new Date().toISOString().split("T")[0],
+    products: [{ name: "", quantity: 1, unit: "", price: 0, hsn: "", category: "Trade" }],
+    taxDetails: [],
+    taxAmount: 0,
+    freightAndForwardingCharges: 0,
+    roundOff: 0,
+    grossAmount: 0,
+    amount: 0,
+    isScanned: false,
+    photoUrl: "",
+    photoPublicId: "",
+    photoResourceType: "image",
+    fileHash: "",
+    fileName: "",
+    fileMimeType: ""
+});
+
+const recalc = (form: FormState) => {
+    const grossAmount = (form.products || []).reduce((s, p) => s + Number(p.quantity || 0) * Number(p.price || 0), 0);
+    const taxAmount = (form.taxDetails || []).reduce((s, t) => s + Number(t.taxAmount || 0), 0);
+    const amount = grossAmount + taxAmount + Number(form.freightAndForwardingCharges || 0) + Number(form.roundOff || 0);
+    return { grossAmount, taxAmount, amount };
 };
 
-const getBillImageSrc = (bill?: Partial<BillItem> | null) => {
-    if (bill?.photoPublicId) {
-        return `/api/bills/image?publicId=${encodeURIComponent(bill.photoPublicId)}`;
-    }
-    return bill?.photoUrl || null;
+const readDataUrl = (file: File) => new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(new Error("Failed to read file."));
+    reader.readAsDataURL(file);
+});
+
+const hashFile = async (file: File) => {
+    const buffer = await file.arrayBuffer();
+    const digest = await crypto.subtle.digest("SHA-256", buffer);
+    return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
 };
 
-export default function BillsView({ params }: { params: Promise<{ id: string }> }) {
+export default function BillsPage() {
     const { user } = useAuth();
     const { activeOrg } = useOrg();
-
+    const searchParams = useSearchParams();
+    const fileRef = useRef<HTMLInputElement>(null);
     const [bills, setBills] = useState<BillItem[]>([]);
+    const [inventory, setInventory] = useState<InventoryItem[]>([]);
     const [loading, setLoading] = useState(true);
-    const [searchQuery, setSearchQuery] = useState("");
-    const [sortParam, setSortParam] = useState("Date (Newest)");
-
-    const [showModal, setShowModal] = useState(false);
-    const [scanMode, setScanMode] = useState(false);
-    const [actionLoading, setActionLoading] = useState(false);
-    const [error, setError] = useState("");
-
-    const [scanning, setScanning] = useState(false);
-    const fileInputRef = useRef<HTMLInputElement>(null);
-    const [scannedImage, setScannedImage] = useState<string | null>(null);
-
-    const [inventoryItems, setInventoryItems] = useState<InventoryItem[]>([]);
-    const [pendingScannedProducts, setPendingScannedProducts] = useState<any[]>([]);
-    const [showPendingProductsModal, setShowPendingProductsModal] = useState(false);
-
-    // Store both parsed companies to allow swapping when changing Bill Type manually
-    const [parsedCompanies, setParsedCompanies] = useState<{ parent: any, customer: any } | null>(null);
-
-    // Form data
-    const [formData, setFormData] = useState<Partial<BillItem> & { vendorGst?: string; vendorAddress?: string; vendorPhone?: string }>({
-        vendorName: "",
-        vendorGst: "",
-        vendorAddress: "",
-        vendorPhone: "",
-        billType: "Purchase",
-        products: [{ name: "", quantity: 1, price: 0, hsn: "", category: "Trade" }],
-        taxAmount: 0,
-        taxDetails: [],
-        freightAndForwardingCharges: 0,
-        roundOff: 0,
-        grossAmount: 0,
-        amount: 0,
-        date: new Date().toISOString().split("T")[0]
-    });
-
+    const [query, setQuery] = useState("");
     const [editingId, setEditingId] = useState<string | null>(null);
-
-    const resolvedParams = React.use(params);
+    const [selectedId, setSelectedId] = useState<string | null>(null);
+    const [showForm, setShowForm] = useState(searchParams.get("mode") === "new");
+    const [form, setForm] = useState<FormState>(emptyForm());
+    const [parsedCompanies, setParsedCompanies] = useState<{ parent: any; customer: any } | null>(null);
+    const [previewSrc, setPreviewSrc] = useState("");
+    const [previewLabel, setPreviewLabel] = useState("");
+    const [error, setError] = useState("");
+    const [busy, setBusy] = useState(false);
+    const [scanning, setScanning] = useState(false);
 
     useEffect(() => {
-        if (!user || !activeOrg || activeOrg.orgId !== resolvedParams.id) return;
-
-        const unsubscribeBills = subscribeToBills(activeOrg.orgId, (items) => {
+        if (!activeOrg || !user) return;
+        const unsubBills = subscribeToBills(activeOrg.orgId, (items) => {
             setBills(items);
             setLoading(false);
+            if (!selectedId && items[0]?.id) setSelectedId(items[0].id);
         });
+        const unsubInventory = subscribeToInventory(activeOrg.orgId, setInventory);
+        return () => { unsubBills(); unsubInventory(); };
+    }, [activeOrg, user, selectedId]);
 
-        const unsubscribeInventory = subscribeToInventory(activeOrg.orgId, (items) => {
-            setInventoryItems(items);
-        });
+    useEffect(() => {
+        if (searchParams.get("mode") === "new") openNew();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [searchParams]);
 
-        return () => {
-            unsubscribeBills();
-            unsubscribeInventory();
-        };
-    }, [user, activeOrg, resolvedParams.id]);
+    useEffect(() => {
+        if (!showForm) return;
+        const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") closeForm(); };
+        window.addEventListener("keydown", onKey);
+        return () => window.removeEventListener("keydown", onKey);
+    }, [showForm]);
 
-    const handleOpenModal = (bill?: BillItem) => {
-        if (bill) {
-            setEditingId(bill.id as string);
-            setFormData({
-                ...bill,
-                billType: normalizeBillType(bill.billType),
-                taxDetails: Array.isArray(bill.taxDetails) ? bill.taxDetails : []
-            });
-            setParsedCompanies(null);
-            setScannedImage(getBillImageSrc(bill));
-        } else {
-            setEditingId(null);
-            setFormData({
-                vendorName: "",
-                vendorGst: "",
-                vendorAddress: "",
-                vendorPhone: "",
-                billType: "Purchase",
-                products: [{ name: "", quantity: 1, price: 0, hsn: "", category: "Trade" }],
-                taxAmount: 0,
-                taxDetails: [],
-                freightAndForwardingCharges: 0,
-                roundOff: 0,
-                grossAmount: 0,
-                amount: 0,
-                date: new Date().toISOString().split("T")[0]
-            });
-            setScannedImage(null);
-            setParsedCompanies(null);
-        }
+    const filtered = useMemo(() => bills.filter((bill) => {
+        const q = query.toLowerCase();
+        if (!q) return true;
+        return (bill.vendorName || "").toLowerCase().includes(q) || (bill.billNumber || "").toLowerCase().includes(q);
+    }), [bills, query]);
+
+    const selected = useMemo(() => bills.find((bill) => bill.id === selectedId) || bills[0] || null, [bills, selectedId]);
+
+    const openNew = () => {
+        setEditingId(null);
+        setForm(emptyForm());
+        setParsedCompanies(null);
+        setPreviewSrc("");
+        setPreviewLabel("");
         setError("");
-        setShowModal(true);
+        setShowForm(true);
     };
 
-    const handleProductChange = (index: number, field: string, value: any) => {
-        const updatedProducts = [...(formData.products || [])];
-        updatedProducts[index] = { ...updatedProducts[index], [field]: value };
+    const closeForm = () => {
+        setShowForm(false);
+        setEditingId(null);
+        setForm(emptyForm());
+        setParsedCompanies(null);
+        setPreviewSrc("");
+        setPreviewLabel("");
+        setError("");
+    };
 
-        if (field === "name") {
-            const found = inventoryItems.find(inv => inv.name.toLowerCase() === String(value).toLowerCase());
+    const openEdit = (bill: BillItem) => {
+        setEditingId(bill.id || null);
+        setForm({ ...bill, taxDetails: bill.taxDetails || [], billType: normalizeBillType(bill.billType) });
+        setPreviewSrc(getBillAssetUrl(bill));
+        setPreviewLabel(bill.fileName || bill.billNumber);
+        setError("");
+        setShowForm(true);
+    };
+
+    const setProduct = (index: number, key: string, value: string | number) => {
+        const products = [...(form.products || [])];
+        products[index] = { ...products[index], [key]: value };
+        if (key === "name") {
+            const found = inventory.find((item) => item.name.toLowerCase() === String(value).toLowerCase());
             if (found) {
-                updatedProducts[index].hsn = found.hsn;
-                updatedProducts[index].category = found.category || "Trade";
+                products[index].hsn = found.hsn;
+                products[index].unit = found.unit || "";
+                products[index].category = found.category || "Trade";
             }
         }
-
-        // Recalculate totals
-        const gross = updatedProducts.reduce((sum, p) => sum + (Number(p.price) * Number(p.quantity)), 0);
-        const taxSum = (formData.taxDetails || []).reduce((sum: number, t: any) => sum + Number(t.taxAmount || 0), 0);
-        const total = gross + taxSum + Number(formData.freightAndForwardingCharges || 0) + Number(formData.roundOff || 0);
-
-        setFormData({ ...formData, products: updatedProducts, grossAmount: gross, taxAmount: taxSum, amount: total });
+        setForm((current) => ({ ...current, products, ...recalc({ ...current, products }) }));
     };
 
-    const handleTaxChange = (index: number, field: string, value: any) => {
-        const updatedTaxes = [...(formData.taxDetails || [])];
-        updatedTaxes[index] = { ...updatedTaxes[index], [field]: value };
-
-        const gross = Number(formData.grossAmount || 0);
-        const taxSum = updatedTaxes.reduce((sum: number, t: any) => sum + Number(t.taxAmount || 0), 0);
-        const total = gross + taxSum + Number(formData.freightAndForwardingCharges || 0) + Number(formData.roundOff || 0);
-
-        setFormData({ ...formData, taxDetails: updatedTaxes, taxAmount: taxSum, amount: total });
+    const setTax = (index: number, key: string, value: string | number) => {
+        const taxDetails = [...(form.taxDetails || [])];
+        taxDetails[index] = { ...taxDetails[index], [key]: value };
+        setForm((current) => ({ ...current, taxDetails, ...recalc({ ...current, taxDetails }) }));
     };
 
-    const handleAddTaxRow = () => {
-        setFormData({
-            ...formData,
-            taxDetails: [...(formData.taxDetails || []), { taxType: "CGST", taxPercentage: 0, taxAmount: 0 }]
-        });
-    };
-
-    const handleRemoveTaxRow = (index: number) => {
-        const updatedTaxes = formData.taxDetails?.filter((_, i) => i !== index) || [];
-        const gross = Number(formData.grossAmount || 0);
-        const taxSum = updatedTaxes.reduce((sum: number, t: any) => sum + Number(t.taxAmount || 0), 0);
-        const total = gross + taxSum + Number(formData.freightAndForwardingCharges || 0) + Number(formData.roundOff || 0);
-
-        setFormData({ ...formData, taxDetails: updatedTaxes, taxAmount: taxSum, amount: total });
-    };
-
-    const handleAddProductRow = () => {
-        setFormData({
-            ...formData,
-            products: [...(formData.products || []), { name: "", quantity: 1, price: 0, hsn: "", category: "Trade" }]
-        });
-    };
-
-    const handleRemoveProductRow = (index: number) => {
-        const updatedProducts = formData.products?.filter((_, i) => i !== index);
-        setFormData({ ...formData, products: updatedProducts });
-    };
-
-    const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-        const file = e.target.files?.[0];
+    const onFile = async (event: React.ChangeEvent<HTMLInputElement>) => {
+        const file = event.target.files?.[0];
         if (!file) return;
-
         setScanning(true);
         setError("");
 
         try {
-            // Convert file to base64 for display and API
-            const reader = new FileReader();
-            reader.readAsDataURL(file);
-            reader.onload = async () => {
-                try {
-                    const base64Data = reader.result as string;
-                    setScannedImage(base64Data);
+            const fileHash = await hashFile(file);
+            if (bills.some((bill) => bill.fileHash === fileHash && bill.id !== editingId)) {
+                throw new Error("This bill file is already uploaded. Duplicate scanned copies are blocked.");
+            }
 
-                    const parsedData = await scanReceipt(base64Data);
-                    const parsedBillType = parsedData.billType === "Unknown"
-                        ? normalizeBillType(formData.billType)
-                        : normalizeBillType(parsedData.billType);
-                    const matchedCompany = parsedBillType === "Purchase"
-                        ? parsedData.parentCompanyDetails
-                        : parsedData.customerCompanyDetails;
+            const fileDataUrl = await readDataUrl(file);
+            const parsed = await scanReceipt(fileDataUrl);
+            const billType = parsed.billType === "Unknown" ? normalizeBillType(form.billType) : normalizeBillType(parsed.billType);
+            const company = billType === "Purchase" ? parsed.parentCompanyDetails : parsed.customerCompanyDetails;
+            const products = (parsed.items || []).length > 0 ? parsed.items!.map((item) => {
+                const found = inventory.find((inv) => inv.name.toLowerCase() === String(item.name || "").toLowerCase());
+                return {
+                    name: item.name || "",
+                    quantity: Number(item.quantity || 1),
+                    unit: item.unit || found?.unit || "",
+                    price: Number(item.price || 0),
+                    hsn: item.hsn || found?.hsn || "",
+                    category: item.category || found?.category || "Trade"
+                };
+            }) : form.products || [];
 
-                    setParsedCompanies({
-                        parent: parsedData.parentCompanyDetails,
-                        customer: parsedData.customerCompanyDetails
-                    });
-
-                    const rawProducts = parsedData.items && parsedData.items.length > 0
-                        ? parsedData.items
-                        : formData.products || [];
-                    const enrichedProducts = rawProducts.map((product: any) => {
-                        const found = inventoryItems.find((item) => item.name.toLowerCase() === product.name?.toLowerCase());
-                        return {
-                            ...product,
-                            name: product.name || "",
-                            quantity: Number(product.quantity || 1),
-                            price: Number(product.price || 0),
-                            hsn: product.hsn || found?.hsn || "",
-                            category: found?.category || product.category || "Trade"
-                        };
-                    });
-                    const hasMissingDetails = enrichedProducts.some((product: any) => !product.name || !product.hsn || !product.quantity);
-                    const grossAmount = enrichedProducts.reduce(
-                        (sum: number, product: any) => sum + (Number(product.quantity || 0) * Number(product.price || 0)),
-                        0
-                    );
-                    const parsedTaxes = Array.isArray(parsedData.taxDetails)
-                        ? parsedData.taxDetails.map((tax: any) => ({
-                            taxType: tax.taxType || "Tax",
-                            taxPercentage: tax.taxPercentage || parsedData.taxPercentage || 0,
-                            taxAmount: Number(tax.taxAmount || 0)
-                        }))
-                        : [];
-                    const taxAmount = parsedTaxes.reduce((sum: number, tax: any) => sum + Number(tax.taxAmount || 0), 0);
-
-                    if (hasMissingDetails) {
-                        setPendingScannedProducts(enrichedProducts);
-                        setShowPendingProductsModal(true);
-                    }
-
-                    setFormData((current) => ({
-                        ...current,
-                        vendorName: matchedCompany?.name?.trim() ? matchedCompany.name : current.vendorName,
-                        vendorGst: matchedCompany?.gst || "",
-                        vendorAddress: matchedCompany?.address || "",
-                        vendorPhone: matchedCompany?.phoneNumbers || "",
-                        billType: parsedBillType,
-                        grossAmount,
-                        taxAmount,
-                        taxDetails: parsedTaxes,
-                        freightAndForwardingCharges: Number(parsedData.freightAndForwardingCharges || 0),
-                        roundOff: Number(parsedData.roundOff || 0),
-                        amount: Number(parsedData.totalAmount || grossAmount + taxAmount),
-                        products: hasMissingDetails ? (current.products || []) : enrichedProducts,
-                        isScanned: true,
-                        photoUrl: base64Data,
-                        photoPublicId: "",
-                        date: parsedData.date || new Date().toISOString().split("T")[0]
-                    }));
-
-                    if (!matchedCompany?.name || !matchedCompany?.gst || !matchedCompany?.address) {
-                        setError("Notice: some company details were missing in the scanned bill. Please review name, GST, and address before saving.");
-                    }
-                } catch (scanError: any) {
-                    setError(scanError.message || "Failed to parse the receipt. Please enter the bill manually.");
-                } finally {
-                    setScanning(false);
-                }
+            const nextForm: FormState = {
+                ...form,
+                billNumber: sanitizeBillNumber(parsed.billNumber) || form.billNumber,
+                vendorName: company?.name || form.vendorName,
+                vendorGst: company?.gst || "",
+                vendorAddress: company?.address || "",
+                vendorPhone: company?.phoneNumbers || "",
+                billType,
+                date: parsed.date || form.date,
+                products,
+                taxDetails: (parsed.taxDetails || []).map((tax) => ({ taxType: tax.taxType || "Tax", taxPercentage: tax.taxPercentage || 0, taxAmount: tax.taxAmount || 0 })),
+                freightAndForwardingCharges: Number(parsed.freightAndForwardingCharges || 0),
+                roundOff: Number(parsed.roundOff || 0),
+                isScanned: true,
+                photoUrl: fileDataUrl,
+                photoPublicId: "",
+                photoResourceType: file.type.includes("pdf") ? "raw" : "image",
+                fileHash,
+                fileName: file.name,
+                fileMimeType: file.type
             };
-        } catch (err: any) {
-            setError(err.message || "Error reading file");
+
+            setParsedCompanies({ parent: parsed.parentCompanyDetails, customer: parsed.customerCompanyDetails });
+            setPreviewSrc(file.type.includes("image/") ? fileDataUrl : "");
+            setPreviewLabel(file.name);
+            setForm({ ...nextForm, ...recalc(nextForm), amount: Number(parsed.totalAmount || recalc(nextForm).amount) });
+        } catch (scanError: any) {
+            setError(scanError.message || "Failed to scan file.");
+        } finally {
             setScanning(false);
+            if (event.target) event.target.value = "";
         }
     };
 
-    const handleSubmit = async (e: React.FormEvent) => {
-        e.preventDefault();
-        setError("");
-        setActionLoading(true);
-
-        if (!activeOrg || !user) {
-            setActionLoading(false);
-            return;
+    const uploadIfNeeded = async (currentForm: FormState) => {
+        if (!currentForm.isScanned || !currentForm.photoUrl || !currentForm.photoUrl.startsWith("data:")) {
+            return {
+                photoUrl: currentForm.photoUrl,
+                photoPublicId: currentForm.photoPublicId,
+                photoResourceType: currentForm.photoResourceType
+            };
         }
 
+        const response = await fetch("/api/upload", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                file: currentForm.photoUrl,
+                fileName: currentForm.fileName,
+                mimeType: currentForm.fileMimeType
+            })
+        });
+        const data = await response.json();
+        if (!response.ok || !data.success) throw new Error(data.error || "Failed to upload bill file.");
+        return {
+            photoUrl: data.url,
+            photoPublicId: data.publicId,
+            photoResourceType: data.resourceType as "image" | "raw" | "video"
+        };
+    };
+
+    const saveBill = async (event: React.FormEvent) => {
+        event.preventDefault();
+        if (!activeOrg || !user) return;
+        setBusy(true);
+        setError("");
+
         try {
-            let finalPhotoUrl = formData.photoUrl;
-            let finalPhotoPublicId = formData.photoPublicId;
-            const normalizedBillType = normalizeBillType(formData.billType);
-            const normalizedAmount = Number(formData.amount || 0);
-            const normalizedProducts = (formData.products || []).map((product) => ({
+            const products = (form.products || []).map((product) => ({
                 ...product,
                 name: String(product.name || "").trim(),
                 quantity: Number(product.quantity || 0),
+                unit: String(product.unit || "").trim(),
                 price: Number(product.price || 0),
-                hsn: product.hsn || "",
-                category: product.category || "Trade"
-            }));
+                hsn: String(product.hsn || "").trim(),
+                category: String(product.category || "Trade")
+            })).filter((product) => product.name);
+            if (!products.length) throw new Error("Add at least one product.");
 
-            if (formData.isScanned && finalPhotoUrl && finalPhotoUrl.startsWith("data:image")) {
-                const res = await fetch("/api/upload", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ image: finalPhotoUrl }),
-                });
-                const data = await res.json();
-                if (data.success) {
-                    finalPhotoUrl = data.url;
-                    finalPhotoPublicId = data.publicId;
-                } else {
-                    throw new Error(data.error || "Unable to upload the bill image.");
-                }
-            }
+            const uploaded = await uploadIfNeeded(form);
+            const payload: BillItem = {
+                ...(form as BillItem),
+                billNumber: sanitizeBillNumber(form.billNumber) || createBillNumber(bills),
+                billType: normalizeBillType(form.billType),
+                products,
+                taxDetails: form.taxDetails || [],
+                ...recalc({ ...form, products }),
+                amount: Number(form.amount || recalc({ ...form, products }).amount),
+                photoUrl: uploaded.photoUrl || "",
+                photoPublicId: uploaded.photoPublicId || "",
+                photoResourceType: uploaded.photoResourceType || "image"
+            };
 
             if (editingId) {
-                const { error: updateError } = await updateBillItem(activeOrg.orgId, editingId, {
-                    ...formData,
-                    billType: normalizedBillType,
-                    products: normalizedProducts,
-                    photoUrl: finalPhotoUrl,
-                    photoPublicId: finalPhotoPublicId
-                } as BillItem);
-                if (updateError) throw new Error(updateError);
+                const previous = bills.find((bill) => bill.id === editingId);
+                if (!previous) throw new Error("Bill not found for update.");
+                const inventoryResult = await reconcileInventoryForBillUpdate(activeOrg.orgId, previous, payload, user.uid);
+                if (inventoryResult.error) throw new Error(inventoryResult.error);
 
-                if (formData.companyId && formData.ledgerEntryId) {
-                    const ledgerType = normalizedBillType === "Purchase" ? "purchaseLedger" : "salesLedger";
-                    const { error: ledgerError } = await updateCompanyLedgerEntry(
-                        activeOrg.orgId,
-                        formData.companyId,
-                        ledgerType,
-                        formData.ledgerEntryId,
-                        {
-                            billType: normalizedBillType,
-                            date: formData.date || new Date().toISOString().split("T")[0],
-                            amount: normalizedAmount,
-                            credit: normalizedBillType === "Sale" ? normalizedAmount : 0,
-                            debit: normalizedBillType === "Purchase" ? normalizedAmount : 0,
-                            companyName: formData.vendorName || "",
-                            billImageUrl: finalPhotoUrl,
-                            billImagePublicId: finalPhotoPublicId
-                        }
-                    );
-                    if (ledgerError) {
-                        throw new Error(ledgerError);
+                const prevLedgerType = previous.billType === "Sale" ? "salesLedger" : "purchaseLedger";
+                const nextLedgerType = payload.billType === "Sale" ? "salesLedger" : "purchaseLedger";
+                const ledgerPayload: Partial<CompanyLedgerEntry> = {
+                    entryKind: "bill",
+                    billId: previous.id,
+                    billNumber: payload.billNumber,
+                    billType: payload.billType,
+                    date: payload.date,
+                    credit: payload.billType === "Sale" ? Number(payload.amount || 0) : 0,
+                    debit: payload.billType === "Purchase" ? Number(payload.amount || 0) : 0,
+                    amount: Number(payload.amount || 0),
+                    companyName: payload.vendorName,
+                    billImageUrl: payload.photoUrl,
+                    billImagePublicId: payload.photoPublicId,
+                    billImageResourceType: payload.photoResourceType
+                };
+
+                if (previous.companyId && previous.ledgerEntryId) {
+                    if (prevLedgerType === nextLedgerType) {
+                        const ledgerResult = await updateCompanyLedgerEntry(activeOrg.orgId, previous.companyId, nextLedgerType, previous.ledgerEntryId, ledgerPayload);
+                        if (ledgerResult.error) throw new Error(ledgerResult.error);
+                    } else {
+                        const deleteResult = await deleteCompanyLedgerEntry(activeOrg.orgId, previous.companyId, prevLedgerType, previous.ledgerEntryId);
+                        if (deleteResult.error) throw new Error(deleteResult.error);
+                        const addLedger = await addCompanyLedgerEntry(activeOrg.orgId, previous.companyId, nextLedgerType, ledgerPayload as Omit<CompanyLedgerEntry, "id" | "createdAt" | "updatedAt">);
+                        if (addLedger.error) throw new Error(addLedger.error);
+                        payload.ledgerEntryId = addLedger.id || "";
                     }
                 }
+
+                const updateResult = await updateBillItem(activeOrg.orgId, editingId, payload);
+                if (updateResult.error) throw new Error(updateResult.error);
             } else {
-                const { id: billId, error: addError } = await addBillItem(activeOrg.orgId, {
-                    ...formData,
-                    billType: normalizedBillType,
-                    products: normalizedProducts,
-                    photoUrl: finalPhotoUrl,
-                    photoPublicId: finalPhotoPublicId,
+                const companyResult = await ensureCompanyProfile(activeOrg.orgId, {
+                    name: payload.vendorName || "Unknown Company",
+                    gst: payload.vendorGst || "",
+                    address: payload.vendorAddress || "",
+                    phoneNumbers: payload.vendorPhone || "",
                     createdBy: user.uid
-                } as BillItem, user.uid);
-                if (addError) throw new Error(addError);
+                });
+                if (companyResult.error) throw new Error(companyResult.error);
 
-                let companyId = "";
-                let ledgerEntryId = "";
+                payload.companyId = companyResult.id || "";
+                const addResult = await addBillItem(activeOrg.orgId, payload, user.uid);
+                if (addResult.error) throw new Error(addResult.error);
 
-                if (formData.vendorName?.trim()) {
-                    const companyResult = await ensureCompanyProfile(activeOrg.orgId, {
-                        name: formData.vendorName.trim(),
-                        createdBy: user.uid,
-                        address: formData.vendorAddress || "",
-                        gst: formData.vendorGst || "",
-                        phoneNumbers: formData.vendorPhone || ""
-                    });
+                const ledgerType = payload.billType === "Sale" ? "salesLedger" : "purchaseLedger";
+                const ledgerResult = await addCompanyLedgerEntry(activeOrg.orgId, companyResult.id || "", ledgerType, {
+                    entryKind: "bill",
+                    billId: addResult.id || "",
+                    billNumber: payload.billNumber,
+                    billType: payload.billType,
+                    date: payload.date,
+                    credit: payload.billType === "Sale" ? Number(payload.amount || 0) : 0,
+                    debit: payload.billType === "Purchase" ? Number(payload.amount || 0) : 0,
+                    amount: Number(payload.amount || 0),
+                    companyName: payload.vendorName,
+                    billImageUrl: payload.photoUrl,
+                    billImagePublicId: payload.photoPublicId,
+                    billImageResourceType: payload.photoResourceType
+                });
+                if (ledgerResult.error) throw new Error(ledgerResult.error);
 
-                    if (companyResult.error) {
-                        throw new Error(companyResult.error);
-                    }
-
-                    companyId = companyResult.id || "";
-                    if (companyId && billId) {
-                        const ledgerType = normalizedBillType === "Purchase" ? "purchaseLedger" : "salesLedger";
-                        const ledgerResult = await addCompanyLedgerEntry(activeOrg.orgId, companyId, ledgerType, {
-                            billId,
-                            billType: normalizedBillType,
-                            date: formData.date || new Date().toISOString().split("T")[0],
-                            credit: normalizedBillType === "Sale" ? normalizedAmount : 0,
-                            debit: normalizedBillType === "Purchase" ? normalizedAmount : 0,
-                            amount: normalizedAmount,
-                            billImageUrl: finalPhotoUrl,
-                            billImagePublicId: finalPhotoPublicId,
-                            companyName: formData.vendorName.trim()
-                        });
-
-                        if (ledgerResult.error) {
-                            throw new Error(ledgerResult.error);
-                        }
-                        ledgerEntryId = ledgerResult.id || "";
-                    }
-                }
-
-                if (billId && (companyId || ledgerEntryId)) {
-                    const { error: relationError } = await updateBillItem(activeOrg.orgId, billId, {
-                        companyId,
-                        ledgerEntryId
-                    });
-                    if (relationError) {
-                        throw new Error(relationError);
-                    }
-                }
-
-                if (normalizedProducts.length > 0) {
-                    const { error: inventoryError } = await syncInventoryFromBill(
-                        activeOrg.orgId,
-                        normalizedProducts,
-                        normalizedBillType,
-                        user.uid
-                    );
-                    if (inventoryError) {
-                        throw new Error(inventoryError);
-                    }
-                }
+                await updateBillItem(activeOrg.orgId, addResult.id || "", { companyId: companyResult.id || "", ledgerEntryId: ledgerResult.id || "" });
+                const inventoryResult = await syncInventoryFromBill(activeOrg.orgId, payload, user.uid);
+                if (inventoryResult.error) throw new Error(inventoryResult.error);
             }
 
-            setShowModal(false);
-        } catch (err: any) {
-            setError(err.message);
-        }
-        setActionLoading(false);
-    };
-
-    const handleDelete = async (id: string) => {
-        if (!activeOrg) return;
-        if (window.confirm("Are you sure you want to delete this bill?")) {
-            await deleteBillItem(activeOrg.orgId, id);
+            closeForm();
+        } catch (saveError: any) {
+            setError(saveError.message || "Failed to save bill.");
+        } finally {
+            setBusy(false);
         }
     };
 
-    const filteredBills = bills.filter(b =>
-        (b.vendorName?.toLowerCase() || "").includes(searchQuery.toLowerCase()) ||
-        (b.id?.toLowerCase() || "").includes(searchQuery.toLowerCase())
-    ).sort((a, b) => {
-        if (sortParam === "Date (Newest)") return new Date(b.date).getTime() - new Date(a.date).getTime();
-        return 0;
-    });
+    const removeBill = async (bill: BillItem) => {
+        if (!activeOrg || !user) return;
+        if (!window.confirm(`Delete ${bill.billNumber}?`)) return;
+
+        try {
+            const inventoryResult = await reconcileInventoryForBillUpdate(activeOrg.orgId, bill, { ...bill, products: [] }, user.uid);
+            if (inventoryResult.error) throw new Error(inventoryResult.error);
+
+            if (bill.companyId && bill.ledgerEntryId) {
+                const ledgerType = bill.billType === "Sale" ? "salesLedger" : "purchaseLedger";
+                const ledgerResult = await deleteCompanyLedgerEntry(activeOrg.orgId, bill.companyId, ledgerType, bill.ledgerEntryId);
+                if (ledgerResult.error) throw new Error(ledgerResult.error);
+            }
+
+            const deleteResult = await deleteBillItem(activeOrg.orgId, bill.id as string);
+            if (deleteResult.error) throw new Error(deleteResult.error);
+        } catch (deleteError: any) {
+            setError(deleteError.message || "Failed to delete bill.");
+        }
+    };
 
     return (
         <div>
             <header className="dashboard-header flex-between" style={{ marginTop: 0 }}>
                 <div>
+                    <p className="section-kicker">Bills Workspace</p>
                     <h1 className="dashboard-title">Bills & Receipts</h1>
-                    <p className="dashboard-subtitle">Manage purchase and sales bills, scan receipts automatically.</p>
+                    <p className="dashboard-subtitle">A simpler bill flow with scanning, updates, and duplicate protection.</p>
                 </div>
-                <div>
-                    <button onClick={() => handleOpenModal()} className="btn-primary" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                        <Plus size={18} /> Add Bill
-                    </button>
-                </div>
+                <button className="btn-primary" onClick={openNew}><Plus size={18} style={{ marginRight: "8px" }} /> Add Bill</button>
             </header>
 
-            <div className="flex-between" style={{ marginBottom: '16px', gap: '16px', marginTop: '24px' }}>
-                <div style={{ flex: 1, position: 'relative' }}>
-                    <input
-                        type="text"
-                        placeholder="Search by Vendor or ID..."
-                        value={searchQuery}
-                        onChange={(e) => setSearchQuery(e.target.value)}
-                        style={{
-                            width: '100%', maxWidth: '400px', padding: '10px 16px',
-                            borderRadius: '8px', border: '1px solid var(--border-color)',
-                            background: 'var(--surface-color)', color: 'var(--text-color)'
-                        }}
-                    />
-                </div>
-            </div>
+            {error && <div className="error-banner" style={{ marginBottom: "16px" }}>{error}</div>}
 
-            <div className="glass-panel" style={{ padding: 0, overflow: 'hidden' }}>
-                <div style={{ overflowX: 'auto' }}>
-                    <table style={{ minWidth: '800px', width: '100%', borderCollapse: 'collapse', textAlign: 'left' }}>
-                        <thead style={{ background: 'var(--border-color)' }}>
-                            <tr>
-                                <th style={{ padding: '16px 24px' }}>Bill ID</th>
-                                <th style={{ padding: '16px 24px' }}>Date</th>
-                                <th style={{ padding: '16px 24px' }}>Vendor</th>
-                                <th style={{ padding: '16px 24px' }}>Category</th>
-                                <th style={{ padding: '16px 24px' }}>Total Amount</th>
-                                <th style={{ padding: '16px 24px', textAlign: 'right' }}>Actions</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {loading ? (
-                                <tr><td colSpan={6} style={{ padding: '24px', textAlign: 'center' }}>Loading...</td></tr>
-                            ) : filteredBills.length === 0 ? (
-                                <tr><td colSpan={6} style={{ padding: '48px', textAlign: 'center', opacity: 0.6 }}>No bills found. Click "Add Bill" to get started.</td></tr>
-                            ) : (
-                                filteredBills.map((b, i) => (
-                                    <tr key={b.id} style={{ borderBottom: '1px solid var(--border-color)' }} className="table-row-hover">
-                                        <td style={{ padding: '16px 24px', fontFamily: 'var(--font-geist-mono)', opacity: 0.8 }}>{b.id}</td>
-                                        <td style={{ padding: '16px 24px' }}>{b.date}</td>
-                                        <td style={{ padding: '16px 24px', fontWeight: 500 }}>{b.vendorName}</td>
-                                        <td style={{ padding: '16px 24px' }}>
-                                            <span style={{
-                                                padding: '4px 8px', borderRadius: '4px', fontSize: '12px',
-                                                background: normalizeBillType(b.billType) === 'Sale' ? 'rgba(16, 185, 129, 0.2)' : 'rgba(239, 68, 68, 0.2)',
-                                                color: normalizeBillType(b.billType) === 'Sale' ? '#10b981' : '#ef4444'
-                                            }}>{normalizeBillType(b.billType)}</span>
-                                        </td>
-                                        <td style={{ padding: '16px 24px', fontWeight: 'bold' }}>₹{b.amount}</td>
-                                        <td style={{ padding: '16px 24px', textAlign: 'right' }}>
-                                            <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
-                                                <button onClick={() => handleOpenModal(b)} className="btn-secondary" style={{ padding: '6px' }} title="Edit"><Edit size={16} /></button>
-                                                <button onClick={() => handleDelete(b.id as string)} className="btn-secondary" style={{ padding: '6px', color: '#ef4444' }} title="Delete"><Trash2 size={16} /></button>
-                                            </div>
-                                        </td>
-                                    </tr>
-                                ))
-                            )}
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-
-            {showModal && (
-                <div style={{
-                    position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
-                    background: 'rgba(0,0,0,0.5)', zIndex: 100,
-                    display: 'flex', alignItems: 'center', justifyContent: 'center',
-                    padding: '20px'
-                }}>
-                    <div className="glass-panel" style={{ width: '100%', maxWidth: '600px', maxHeight: '90vh', overflowY: 'auto', position: 'relative' }}>
-                        <button onClick={() => setShowModal(false)} style={{ position: 'absolute', top: '24px', right: '24px', background: 'none', border: 'none', color: 'var(--text-color)', cursor: 'pointer' }}>
-                            <X size={20} />
-                        </button>
-
-                        <h2 style={{ fontSize: '1.25rem', marginBottom: '24px' }}>{editingId ? 'Edit Bill' : 'Add New Bill'}</h2>
-
-                        {!editingId && !scanMode && !formData.isScanned && (
-                            <div style={{ display: 'flex', gap: '16px', marginBottom: '24px' }}>
-                                <button type="button" onClick={() => setScanMode(true)} className="btn-primary" style={{ flex: 1, display: 'flex', justifyContent: 'center', gap: '8px' }}>
-                                    <Camera size={18} /> Scan a Bill
-                                </button>
-                                <button type="button" className="btn-secondary" style={{ flex: 1 }} disabled>
-                                    Manual Fill
-                                </button>
-                            </div>
-                        )}
-
-                        {scanMode && !formData.isScanned && (
-                            <div style={{ marginBottom: '24px', padding: '24px', border: '2px dashed var(--border-color)', borderRadius: '8px', textAlign: 'center' }}>
-                                <input type="file" accept="image/*" ref={fileInputRef} style={{ display: 'none' }} onChange={handleFileUpload} />
-                                <button type="button" onClick={() => fileInputRef.current?.click()} className="btn-primary" disabled={scanning}>
-                                    {scanning ? 'Scanning & Parsing...' : 'Select Image File'}
-                                </button>
-                                {error && <p style={{ color: '#ef4444', marginTop: '12px' }}>{error}</p>}
-                                <button type="button" onClick={() => setScanMode(false)} className="btn-secondary" style={{ marginTop: '12px', marginLeft: '12px' }}>Cancel</button>
-                            </div>
-                        )}
-
-                        {error && !scanMode && <div style={{ background: 'rgba(239, 68, 68, 0.1)', color: '#ef4444', padding: '12px', borderRadius: '8px', marginBottom: '16px' }}>{error}</div>}
-
-                        <form onSubmit={handleSubmit} style={{ display: (!scanMode || formData.isScanned) ? 'flex' : 'none', flexDirection: 'column', gap: '16px' }}>
-
-                            {scannedImage && (
-                                <div style={{ marginBottom: '16px', textAlign: 'center' }}>
-                                    <div style={{ maxWidth: '100%', overflowX: 'auto', display: 'flex', justifyContent: 'center' }}>
-                                        <img src={scannedImage} alt="Scanned Bill" style={{ maxHeight: '300px', borderRadius: '8px', border: '1px solid var(--border-color)', objectFit: 'contain' }} />
-                                    </div>
-                                    {formData.isScanned && <p style={{ fontSize: '12px', color: '#10b981', marginTop: '8px' }}>✓ Data Extracted Successfully</p>}
-                                </div>
-                            )}
-
-                            <div style={{ display: 'flex', gap: '16px' }}>
-                                <div style={{ flex: 1 }}>
-                                    <label style={{ display: 'block', marginBottom: '8px', fontSize: '0.875rem', fontWeight: 500 }}>Vendor / Company Name*</label>
-                                    <input required type="text" value={formData.vendorName} onChange={e => setFormData({ ...formData, vendorName: e.target.value })}
-                                        style={{ width: '100%', padding: '10px 16px', borderRadius: '8px', border: '1px solid var(--border-color)', background: 'var(--surface-color)', color: 'var(--text-color)' }} />
-                                </div>
-                                <div style={{ flex: 1 }}>
-                                    <label style={{ display: 'block', marginBottom: '8px', fontSize: '0.875rem', fontWeight: 500 }}>Bill Category*</label>
-                                    <select value={formData.billType} onChange={e => {
-                                        const newType = e.target.value as "Purchase" | "Sale";
-                                        let updates = { billType: newType } as any;
-
-                                        if (parsedCompanies && formData.isScanned) {
-                                            const swapCompany = newType === "Purchase" ? parsedCompanies.parent : parsedCompanies.customer;
-                                            updates.vendorName = swapCompany?.name || "";
-                                            updates.vendorGst = swapCompany?.gst || "";
-                                            updates.vendorAddress = swapCompany?.address || "";
-                                            updates.vendorPhone = swapCompany?.phoneNumbers || "";
-                                        }
-
-                                        setFormData({ ...formData, ...updates });
-                                    }} style={{ width: '100%', padding: '10px 16px', borderRadius: '8px', border: '1px solid var(--border-color)', background: 'var(--surface-color)', color: 'var(--text-color)' }}>
-                                        <option value="Purchase">Purchase (Increments Inventory)</option>
-                                        <option value="Sale">Sale (Decrements Inventory)</option>
-                                    </select>
-                                </div>
-                            </div>
-
-                            <div style={{ display: 'flex', gap: '16px' }}>
-                                <div style={{ flex: 1 }}>
-                                    <label style={{ display: 'block', marginBottom: '8px', fontSize: '0.875rem', fontWeight: 500 }}>Vendor GST</label>
-                                    <input type="text" value={formData.vendorGst} onChange={e => setFormData({ ...formData, vendorGst: e.target.value })}
-                                        style={{ width: '100%', padding: '10px 16px', borderRadius: '8px', border: '1px solid var(--border-color)', background: 'var(--surface-color)', color: 'var(--text-color)' }} />
-                                </div>
-                                <div style={{ flex: 1 }}>
-                                    <label style={{ display: 'block', marginBottom: '8px', fontSize: '0.875rem', fontWeight: 500 }}>Vendor Address</label>
-                                    <input type="text" value={formData.vendorAddress} onChange={e => setFormData({ ...formData, vendorAddress: e.target.value })}
-                                        style={{ width: '100%', padding: '10px 16px', borderRadius: '8px', border: '1px solid var(--border-color)', background: 'var(--surface-color)', color: 'var(--text-color)' }} />
-                                </div>
-                                <div style={{ flex: 1 }}>
-                                    <label style={{ display: 'block', marginBottom: '8px', fontSize: '0.875rem', fontWeight: 500 }}>Vendor Phone</label>
-                                    <input type="text" value={formData.vendorPhone} onChange={e => setFormData({ ...formData, vendorPhone: e.target.value })}
-                                        style={{ width: '100%', padding: '10px 16px', borderRadius: '8px', border: '1px solid var(--border-color)', background: 'var(--surface-color)', color: 'var(--text-color)' }} />
-                                </div>
-                            </div>
-
-                            <div>
-                                <h3 style={{ fontSize: '1rem', marginTop: '16px', borderBottom: '1px solid var(--border-color)', paddingBottom: '8px' }}>Products</h3>
-
-                                <datalist id="inventory-products-list">
-                                    {inventoryItems.map(item => (
-                                        <option key={item.id} value={item.name} />
-                                    ))}
-                                </datalist>
-
-                                <div style={{ overflowX: 'auto' }}>
-                                    <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', minWidth: '700px' }}>
-                                        <thead style={{ background: 'var(--border-color)' }}>
-                                            <tr>
-                                                <th style={{ padding: '8px 12px', fontWeight: 500, fontSize: '0.875rem', opacity: 0.7 }}>Product Name*</th>
-                                                <th style={{ padding: '8px 12px', fontWeight: 500, fontSize: '0.875rem', opacity: 0.7, width: '120px' }}>HSN*</th>
-                                                <th style={{ padding: '8px 12px', fontWeight: 500, fontSize: '0.875rem', opacity: 0.7, width: '140px' }}>Category*</th>
-                                                <th style={{ padding: '8px 12px', fontWeight: 500, fontSize: '0.875rem', opacity: 0.7, width: '100px' }}>Qty*</th>
-                                                <th style={{ padding: '8px 12px', fontWeight: 500, fontSize: '0.875rem', opacity: 0.7, width: '120px' }}>Price*</th>
-                                                <th style={{ padding: '8px 12px', fontWeight: 500, fontSize: '0.875rem', opacity: 0.7, width: '50px' }}></th>
-                                            </tr>
-                                        </thead>
-                                        <tbody>
-                                            {formData.products?.map((p, index) => (
-                                                <tr key={index} style={{ borderBottom: '1px solid var(--border-color)' }}>
-                                                    <td style={{ padding: '8px 4px' }}>
-                                                        <input type="text" list="inventory-products-list" placeholder="Product Name" value={p.name} onChange={e => handleProductChange(index, "name", e.target.value)} required
-                                                            style={{ width: '100%', padding: '8px', borderRadius: '4px', border: '1px solid var(--border-color)', background: 'var(--surface-color)', color: 'var(--text-color)' }} />
-                                                    </td>
-                                                    <td style={{ padding: '8px 4px' }}>
-                                                        <input type="text" placeholder="HSN" value={p.hsn || ""} onChange={e => handleProductChange(index, "hsn", e.target.value)} required
-                                                            style={{ width: '100%', padding: '8px', borderRadius: '4px', border: '1px solid var(--border-color)', background: 'var(--surface-color)', color: 'var(--text-color)' }} />
-                                                    </td>
-                                                    <td style={{ padding: '8px 4px' }}>
-                                                        <select value={p.category || "Trade"} onChange={e => handleProductChange(index, "category", e.target.value)} required
-                                                            style={{ width: '100%', padding: '8px', borderRadius: '4px', border: '1px solid var(--border-color)', background: 'var(--surface-color)', color: 'var(--text-color)' }}>
-                                                            <option value="Trade">Trade</option>
-                                                            <option value="Manufactured">Manufactured</option>
-                                                        </select>
-                                                    </td>
-                                                    <td style={{ padding: '8px 4px' }}>
-                                                        <input type="number" placeholder="Qty" value={p.quantity} onChange={e => handleProductChange(index, "quantity", e.target.value)} required
-                                                            style={{ width: '100%', padding: '8px', borderRadius: '4px', border: '1px solid var(--border-color)', background: 'var(--surface-color)', color: 'var(--text-color)' }} />
-                                                    </td>
-                                                    <td style={{ padding: '8px 4px' }}>
-                                                        <input type="number" placeholder="Price" value={p.price} onChange={e => handleProductChange(index, "price", e.target.value)} required
-                                                            style={{ width: '100%', padding: '8px', borderRadius: '4px', border: '1px solid var(--border-color)', background: 'var(--surface-color)', color: 'var(--text-color)' }} />
-                                                    </td>
-                                                    <td style={{ padding: '8px 4px', textAlign: 'center' }}>
-                                                        <button type="button" onClick={() => handleRemoveProductRow(index)} style={{ padding: '4px', color: '#ef4444', background: 'transparent', border: 'none', cursor: 'pointer' }}><Trash2 size={16} /></button>
-                                                    </td>
-                                                </tr>
-                                            ))}
-                                        </tbody>
-                                    </table>
-                                </div>
-                                <button type="button" onClick={handleAddProductRow} className="btn-secondary" style={{ marginTop: '12px', fontSize: '12px' }}>+ Add Product Line</button>
-                            </div>
-
-                            <div>
-                                <h3 style={{ fontSize: '1rem', marginTop: '16px', borderBottom: '1px solid var(--border-color)', paddingBottom: '8px' }}>Taxes & Additional Charges</h3>
-
-                                <div style={{ overflowX: 'auto', marginTop: '12px' }}>
-                                    <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', minWidth: '500px' }}>
-                                        <thead style={{ background: 'var(--border-color)' }}>
-                                            <tr>
-                                                <th style={{ padding: '8px 12px', fontWeight: 500, fontSize: '0.875rem', opacity: 0.7 }}>Tax Type</th>
-                                                <th style={{ padding: '8px 12px', fontWeight: 500, fontSize: '0.875rem', opacity: 0.7, width: '150px' }}>Percentage (%)</th>
-                                                <th style={{ padding: '8px 12px', fontWeight: 500, fontSize: '0.875rem', opacity: 0.7, width: '150px' }}>Tax Amount</th>
-                                                <th style={{ padding: '8px 12px', fontWeight: 500, fontSize: '0.875rem', opacity: 0.7, width: '50px' }}></th>
-                                            </tr>
-                                        </thead>
-                                        <tbody>
-                                            {formData.taxDetails?.map((t, index) => (
-                                                <tr key={index} style={{ borderBottom: '1px solid var(--border-color)' }}>
-                                                    <td style={{ padding: '8px 4px' }}>
-                                                        <input type="text" placeholder="e.g. CGST" value={t.taxType} onChange={e => handleTaxChange(index, "taxType", e.target.value)}
-                                                            style={{ width: '100%', padding: '8px', borderRadius: '4px', border: '1px solid var(--border-color)', background: 'var(--surface-color)', color: 'var(--text-color)' }} />
-                                                    </td>
-                                                    <td style={{ padding: '8px 4px' }}>
-                                                        <input type="number" step="any" placeholder="%" value={t.taxPercentage} onChange={e => handleTaxChange(index, "taxPercentage", e.target.value)}
-                                                            style={{ width: '100%', padding: '8px', borderRadius: '4px', border: '1px solid var(--border-color)', background: 'var(--surface-color)', color: 'var(--text-color)' }} />
-                                                    </td>
-                                                    <td style={{ padding: '8px 4px' }}>
-                                                        <input type="number" step="any" placeholder="Amount" value={t.taxAmount} onChange={e => handleTaxChange(index, "taxAmount", e.target.value)}
-                                                            style={{ width: '100%', padding: '8px', borderRadius: '4px', border: '1px solid var(--border-color)', background: 'var(--surface-color)', color: 'var(--text-color)' }} />
-                                                    </td>
-                                                    <td style={{ padding: '8px 4px', textAlign: 'center' }}>
-                                                        <button type="button" onClick={() => handleRemoveTaxRow(index)} style={{ padding: '4px', color: '#ef4444', background: 'transparent', border: 'none', cursor: 'pointer' }}><Trash2 size={16} /></button>
-                                                    </td>
-                                                </tr>
-                                            ))}
-                                        </tbody>
-                                    </table>
-                                </div>
-                                <button type="button" onClick={handleAddTaxRow} className="btn-secondary" style={{ marginTop: '12px', fontSize: '12px' }}>+ Add Tax Line</button>
-                            </div>
-
-                            <div style={{ display: 'flex', gap: '16px', marginTop: '16px', flexWrap: 'wrap', justifyContent: 'flex-end', background: 'var(--surface-color)', padding: '16px', borderRadius: '8px', border: '1px solid var(--border-color)' }}>
-                                <div style={{ flex: '1 1 150px', maxWidth: '200px' }}>
-                                    <label style={{ display: 'block', marginBottom: '8px', fontSize: '0.875rem' }}>Freight & Forwarding</label>
-                                    <input type="number" step="any" value={formData.freightAndForwardingCharges || 0} onChange={e => setFormData({ ...formData, freightAndForwardingCharges: Number(e.target.value), amount: Number(formData.grossAmount) + Number(formData.taxAmount || 0) + Number(e.target.value) + Number(formData.roundOff || 0) })}
-                                        style={{ width: '100%', padding: '10px 16px', borderRadius: '8px', border: '1px solid var(--border-color)', background: 'var(--bg-color)', color: 'var(--text-color)' }} />
-                                </div>
-                                <div style={{ flex: '1 1 150px', maxWidth: '200px' }}>
-                                    <label style={{ display: 'block', marginBottom: '8px', fontSize: '0.875rem' }}>Round Off</label>
-                                    <input type="number" step="any" value={formData.roundOff || 0} onChange={e => setFormData({ ...formData, roundOff: Number(e.target.value), amount: Number(formData.grossAmount) + Number(formData.taxAmount || 0) + Number(formData.freightAndForwardingCharges || 0) + Number(e.target.value) })}
-                                        style={{ width: '100%', padding: '10px 16px', borderRadius: '8px', border: '1px solid var(--border-color)', background: 'var(--bg-color)', color: 'var(--text-color)' }} />
-                                </div>
-                                <div style={{ flex: '1 1 150px', maxWidth: '200px' }}>
-                                    <label style={{ display: 'block', marginBottom: '8px', fontSize: '0.875rem', fontWeight: 600 }}>Total Amount</label>
-                                    <input type="number" value={formData.amount} disabled
-                                        style={{ width: '100%', padding: '10px 16px', borderRadius: '8px', border: '1px solid var(--border-color)', background: 'var(--bg-color)', color: 'var(--text-color)', opacity: 0.7, fontWeight: 600 }} />
-                                </div>
-                            </div>
-
-                            <div style={{ marginTop: '24px', display: 'flex', gap: '12px' }}>
-                                <button type="button" onClick={() => { setShowModal(false); setScanMode(false); }} className="btn-secondary" style={{ flex: 1 }}>Cancel</button>
-                                <button type="submit" disabled={actionLoading} className="btn-primary" style={{ flex: 1 }}>{actionLoading ? 'Saving...' : 'Save Bill'}</button>
-                            </div>
-                        </form>
-                    </div>
-                </div>
-            )}
-            {showPendingProductsModal && (
-                <div style={{
-                    position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
-                    background: 'rgba(0,0,0,0.7)', zIndex: 200,
-                    display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '20px'
-                }}>
-                    <div className="glass-panel" style={{ width: '100%', maxWidth: '700px', maxHeight: '90vh', overflowY: 'auto' }}>
-                        <h2 style={{ marginBottom: '16px' }}>Complete Missing Product Details</h2>
-                        <p style={{ marginBottom: '16px', fontSize: '14px', opacity: 0.8 }}>Some scanned products are missing mandatory details (Name, HSN, Quantity). Please fill them to proceed.</p>
-
-                        <datalist id="inventory-products-modal-list">
-                            {inventoryItems.map(item => (
-                                <option key={item.id} value={item.name} />
-                            ))}
-                        </datalist>
-
-                        {pendingScannedProducts.map((p, index) => (
-                            <div key={index} style={{ display: 'flex', gap: '8px', marginBottom: '12px', flexWrap: 'wrap', borderBottom: '1px solid var(--border-color)', paddingBottom: '12px' }}>
-                                <div style={{ flex: 2, minWidth: '150px' }}>
-                                    <label style={{ fontSize: '12px', opacity: 0.8 }}>Product Name*</label>
-                                    <input type="text" list="inventory-products-modal-list" required value={p.name || ""} onChange={(e) => {
-                                        const upd = [...pendingScannedProducts];
-                                        upd[index].name = e.target.value;
-                                        setPendingScannedProducts(upd);
-                                    }} style={{ width: '100%', padding: '8px', borderRadius: '4px', border: '1px solid var(--border-color)', background: 'var(--surface-color)', color: 'var(--text-color)' }} />
-                                </div>
-                                <div style={{ flex: 1, minWidth: '100px' }}>
-                                    <label style={{ fontSize: '12px', opacity: 0.8 }}>HSN*</label>
-                                    <input type="text" required value={p.hsn || ""} onChange={(e) => {
-                                        const upd = [...pendingScannedProducts];
-                                        upd[index].hsn = e.target.value;
-                                        setPendingScannedProducts(upd);
-                                    }} style={{ width: '100%', padding: '8px', borderRadius: '4px', border: '1px solid var(--border-color)', background: 'var(--surface-color)', color: 'var(--text-color)' }} />
-                                </div>
-                                <div style={{ flex: 1, minWidth: '100px' }}>
-                                    <label style={{ fontSize: '12px', opacity: 0.8 }}>Category*</label>
-                                    <select value={p.category || "Trade"} onChange={(e) => {
-                                        const upd = [...pendingScannedProducts];
-                                        upd[index].category = e.target.value;
-                                        setPendingScannedProducts(upd);
-                                    }} style={{ width: '100%', padding: '8px', borderRadius: '4px', border: '1px solid var(--border-color)', background: 'var(--surface-color)', color: 'var(--text-color)' }}>
-                                        <option value="Trade">Trade</option>
-                                        <option value="Manufactured">Manufactured</option>
-                                    </select>
-                                </div>
-                                <div style={{ flex: 1, minWidth: '80px' }}>
-                                    <label style={{ fontSize: '12px', opacity: 0.8 }}>Qty*</label>
-                                    <input type="number" required value={p.quantity || ""} onChange={(e) => {
-                                        const upd = [...pendingScannedProducts];
-                                        upd[index].quantity = Number(e.target.value);
-                                        setPendingScannedProducts(upd);
-                                    }} style={{ width: '100%', padding: '8px', borderRadius: '4px', border: '1px solid var(--border-color)', background: 'var(--surface-color)', color: 'var(--text-color)' }} />
-                                </div>
-                                <div style={{ flex: 1, minWidth: '80px' }}>
-                                    <label style={{ fontSize: '12px', opacity: 0.8 }}>Price</label>
-                                    <input type="number" value={p.price || ""} onChange={(e) => {
-                                        const upd = [...pendingScannedProducts];
-                                        upd[index].price = Number(e.target.value);
-                                        setPendingScannedProducts(upd);
-                                    }} style={{ width: '100%', padding: '8px', borderRadius: '4px', border: '1px solid var(--border-color)', background: 'var(--surface-color)', color: 'var(--text-color)' }} />
-                                </div>
-                            </div>
-                        ))}
-
-                        <div style={{ display: 'flex', gap: '12px', marginTop: '16px' }}>
-                            <button className="btn-secondary" onClick={() => setShowPendingProductsModal(false)}>Cancel</button>
-                            <button className="btn-primary" onClick={() => {
-                                const allValid = pendingScannedProducts.every(p => p.name && p.hsn && p.quantity);
-                                if (!allValid) {
-                                    alert("Please fill all required fields (Name, HSN, Qty) for all products.");
-                                    return;
-                                }
-                                setFormData(prev => ({ ...prev, products: pendingScannedProducts }));
-                                setShowPendingProductsModal(false);
-                            }}>Confirm & Add to Bill</button>
+            <div className="workspace-grid">
+                <section className="glass-panel" style={{ padding: 0, overflow: "hidden" }}>
+                    <div style={{ padding: "18px", borderBottom: "1px solid var(--border-color)" }}>
+                        <div className="search-box">
+                            <Search size={16} />
+                            <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search by bill number or company..." />
                         </div>
                     </div>
-                </div>
-            )}
+                    <div style={{ maxHeight: "72vh", overflowY: "auto" }}>
+                        {loading ? <div style={{ padding: "24px" }}>Loading bills...</div> : filtered.length === 0 ? <div style={{ padding: "24px", opacity: 0.7 }}>No bills found.</div> : filtered.map((bill) => (
+                            <button key={bill.id} type="button" className={`workspace-list-row ${selected?.id === bill.id ? "active" : ""}`} onClick={() => setSelectedId(bill.id || null)}>
+                                <div>
+                                    <div style={{ fontWeight: 700 }}>{bill.billNumber || bill.id}</div>
+                                    <div style={{ opacity: 0.76 }}>{bill.vendorName}</div>
+                                </div>
+                                <div style={{ textAlign: "right" }}>
+                                    <div className="status-pill" style={{ background: bill.billType === "Sale" ? "rgba(22,163,74,.12)" : "rgba(220,38,38,.12)", color: bill.billType === "Sale" ? "#15803d" : "#dc2626" }}>{bill.billType}</div>
+                                    <div style={{ marginTop: "8px", fontWeight: 700 }}>{formatCurrencyINR(bill.amount)}</div>
+                                </div>
+                            </button>
+                        ))}
+                    </div>
+                </section>
+
+                <section className="glass-panel workspace-detail-panel">
+                    {showForm ? (
+                        <form onSubmit={saveBill} style={{ display: "grid", gap: "16px" }}>
+                            <div className="section-header-row">
+                                <div>
+                                    <p className="section-kicker">{editingId ? "Edit Bill" : "New Bill"}</p>
+                                    <h2 className="section-title">{editingId ? form.billNumber || "Update bill" : "Add bill"}</h2>
+                                </div>
+                                <button type="button" className="panel-icon-btn" onClick={closeForm}><X size={18} /></button>
+                            </div>
+
+                            <div className="bill-section">
+                                <h3 className="bill-section-title">Bill Details</h3>
+                                <div className="form-grid-3">
+                                    <div><label className="section-label">Bill Number</label><input className="input-field" value={form.billNumber || ""} onChange={(e) => setForm({ ...form, billNumber: e.target.value })} /></div>
+                                    <div><label className="section-label">Date</label><input className="input-field" type="date" value={form.date || ""} onChange={(e) => setForm({ ...form, date: e.target.value })} /></div>
+                                    <div><label className="section-label">Type</label><select className="input-field" value={normalizeBillType(form.billType)} onChange={(e) => {
+                                        const billType = normalizeBillType(e.target.value);
+                                        const next = { ...form, billType };
+                                        if (parsedCompanies && !editingId) {
+                                            const company = billType === "Purchase" ? parsedCompanies.parent : parsedCompanies.customer;
+                                            setForm({ ...next, vendorName: company?.name || next.vendorName, vendorGst: company?.gst || "", vendorAddress: company?.address || "", vendorPhone: company?.phoneNumbers || "" });
+                                            return;
+                                        }
+                                        setForm(next);
+                                    }}><option value="Purchase">Purchase</option><option value="Sale">Sale</option></select></div>
+                                </div>
+                            </div>
+
+                            <div className="bill-section">
+                                <div className="section-header-row">
+                                    <h3 className="bill-section-title">Bill File</h3>
+                                    {!editingId && <button type="button" className="btn-secondary" onClick={() => fileRef.current?.click()} disabled={scanning}><Upload size={16} style={{ marginRight: "8px" }} /> {scanning ? "Scanning..." : "Upload PNG / JPG / WEBP / PDF"}</button>}
+                                </div>
+                                <input ref={fileRef} type="file" accept=".png,.jpg,.jpeg,.webp,.pdf,image/png,image/jpeg,image/webp,application/pdf" style={{ display: "none" }} onChange={onFile} />
+                                <div className="file-preview-box">
+                                    {previewSrc ? <img src={previewSrc} alt="Bill preview" style={{ maxWidth: "100%", maxHeight: "240px", borderRadius: "12px", objectFit: "contain" }} /> : <div style={{ opacity: 0.7 }}>Upload a supported image or PDF to scan the bill.</div>}
+                                    {previewLabel && <div style={{ marginTop: "10px", opacity: 0.75 }}>{previewLabel}</div>}
+                                    {editingId && <div style={{ marginTop: "10px", opacity: 0.75 }}>Company details and bill file are locked while updating.</div>}
+                                </div>
+                            </div>
+
+                            <div className="bill-section">
+                                <h3 className="bill-section-title">Company Details</h3>
+                                <div className="form-grid-2">
+                                    <div><label className="section-label">Company Name</label><input className="input-field" value={form.vendorName || ""} onChange={(e) => setForm({ ...form, vendorName: e.target.value })} disabled={!!editingId} required /></div>
+                                    <div><label className="section-label">GST</label><input className="input-field" value={form.vendorGst || ""} onChange={(e) => setForm({ ...form, vendorGst: e.target.value })} disabled={!!editingId} /></div>
+                                </div>
+                                <div className="form-grid-2" style={{ marginTop: "12px" }}>
+                                    <div><label className="section-label">Phone</label><input className="input-field" value={form.vendorPhone || ""} onChange={(e) => setForm({ ...form, vendorPhone: e.target.value })} disabled={!!editingId} /></div>
+                                    <div><label className="section-label">Address</label><input className="input-field" value={form.vendorAddress || ""} onChange={(e) => setForm({ ...form, vendorAddress: e.target.value })} disabled={!!editingId} /></div>
+                                </div>
+                            </div>
+
+                            <div className="bill-section">
+                                <div className="section-header-row">
+                                    <h3 className="bill-section-title">Products</h3>
+                                    <button type="button" className="btn-secondary" onClick={() => setForm({ ...form, products: [...(form.products || []), { name: "", quantity: 1, unit: "", price: 0, hsn: "", category: "Trade" }] })}>Add Row</button>
+                                </div>
+                                <div style={{ display: "grid", gap: "10px" }}>
+                                    {(form.products || []).map((product, index) => (
+                                        <div key={index} className="compact-product-grid">
+                                            <input className="input-field" placeholder="Product" value={product.name} onChange={(e) => setProduct(index, "name", e.target.value)} required />
+                                            <input className="input-field" placeholder="HSN" value={product.hsn || ""} onChange={(e) => setProduct(index, "hsn", e.target.value)} required />
+                                            <input className="input-field" type="number" placeholder="Qty" value={product.quantity} onChange={(e) => setProduct(index, "quantity", Number(e.target.value))} required />
+                                            <input className="input-field" placeholder="Unit" value={product.unit || ""} onChange={(e) => setProduct(index, "unit", e.target.value)} />
+                                            <input className="input-field" type="number" placeholder="Unit Price" value={product.price} onChange={(e) => setProduct(index, "price", Number(e.target.value))} required />
+                                            <button type="button" className="panel-icon-btn" onClick={() => {
+                                                const products = (form.products || []).filter((_, row) => row !== index);
+                                                setForm((current) => ({ ...current, products, ...recalc({ ...current, products }) }));
+                                            }}><Trash2 size={16} /></button>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+
+                            <div className="bill-section">
+                                <h3 className="bill-section-title">Taxes & Totals</h3>
+                                {(form.taxDetails || []).map((tax, index) => (
+                                    <div key={index} className="form-grid-4" style={{ marginBottom: "10px" }}>
+                                        <input className="input-field" placeholder="Tax type" value={tax.taxType} onChange={(e) => setTax(index, "taxType", e.target.value)} />
+                                        <input className="input-field" type="number" placeholder="Tax %" value={tax.taxPercentage} onChange={(e) => setTax(index, "taxPercentage", Number(e.target.value))} />
+                                        <input className="input-field" type="number" placeholder="Tax amount" value={tax.taxAmount} onChange={(e) => setTax(index, "taxAmount", Number(e.target.value))} />
+                                        <button type="button" className="panel-icon-btn" onClick={() => {
+                                            const taxDetails = (form.taxDetails || []).filter((_, row) => row !== index);
+                                            setForm((current) => ({ ...current, taxDetails, ...recalc({ ...current, taxDetails }) }));
+                                        }}><Trash2 size={16} /></button>
+                                    </div>
+                                ))}
+                                <div style={{ display: "flex", gap: "10px", marginBottom: "12px" }}>
+                                    <button type="button" className="btn-secondary" onClick={() => setForm({ ...form, taxDetails: [...(form.taxDetails || []), { taxType: "CGST", taxPercentage: 0, taxAmount: 0 }] })}>Add Tax</button>
+                                </div>
+                                <div className="form-grid-3">
+                                    <div><label className="section-label">Freight</label><input className="input-field" type="number" value={form.freightAndForwardingCharges || 0} onChange={(e) => setForm((current) => ({ ...current, freightAndForwardingCharges: Number(e.target.value), ...recalc({ ...current, freightAndForwardingCharges: Number(e.target.value) }) }))} /></div>
+                                    <div><label className="section-label">Round Off</label><input className="input-field" type="number" value={form.roundOff || 0} onChange={(e) => setForm((current) => ({ ...current, roundOff: Number(e.target.value), ...recalc({ ...current, roundOff: Number(e.target.value) }) }))} /></div>
+                                    <div><label className="section-label">Total</label><input className="input-field" value={formatCurrencyINR(form.amount)} disabled /></div>
+                                </div>
+                            </div>
+
+                            <div style={{ display: "flex", gap: "12px", justifyContent: "flex-end" }}>
+                                <button type="button" className="btn-secondary" onClick={closeForm}>Cancel</button>
+                                <button className="btn-primary" disabled={busy}>{busy ? "Saving..." : editingId ? "Update Bill" : "Save Bill"}</button>
+                            </div>
+                        </form>
+                    ) : selected ? (
+                        <div>
+                            <div className="section-header-row" style={{ marginBottom: "18px" }}>
+                                <div>
+                                    <p className="section-kicker">Selected Bill</p>
+                                    <h2 className="section-title">{selected.billNumber}</h2>
+                                    <p style={{ opacity: 0.72 }}>{selected.vendorName}</p>
+                                </div>
+                                <div style={{ display: "flex", gap: "10px" }}>
+                                    <button type="button" className="btn-secondary" onClick={() => openEdit(selected)}><Edit size={16} style={{ marginRight: "8px" }} /> Edit</button>
+                                    <button type="button" className="btn-secondary" onClick={() => removeBill(selected)} style={{ color: "#dc2626" }}><Trash2 size={16} style={{ marginRight: "8px" }} /> Delete</button>
+                                </div>
+                            </div>
+
+                            <div className="bill-section">
+                                <div className="detail-pair-grid">
+                                    <div><span className="detail-label">Type</span><strong>{selected.billType}</strong></div>
+                                    <div><span className="detail-label">Date</span><strong>{selected.date}</strong></div>
+                                    <div><span className="detail-label">Amount</span><strong>{formatCurrencyINR(selected.amount)}</strong></div>
+                                    <div><span className="detail-label">Bill File</span>{selected.photoPublicId ? <a className="inline-link" href={getBillAssetUrl(selected)} target="_blank" rel="noreferrer">Open file</a> : <strong>Not uploaded</strong>}</div>
+                                </div>
+                            </div>
+
+                            <div className="bill-section">
+                                <h3 className="bill-section-title">Products</h3>
+                                <div style={{ display: "grid", gap: "10px" }}>
+                                    {(selected.products || []).map((product, index) => (
+                                        <div key={`${product.name}-${index}`} className="list-row-card">
+                                            <div>
+                                                <div style={{ fontWeight: 700 }}>{product.name}</div>
+                                                <div style={{ opacity: 0.72 }}>{product.hsn || "No HSN"} {product.unit ? `• ${product.unit}` : ""}</div>
+                                            </div>
+                                            <div style={{ textAlign: "right" }}>
+                                                <div>{product.quantity} {product.unit || ""}</div>
+                                                <div style={{ fontWeight: 700 }}>{formatCurrencyINR(product.price)}</div>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        </div>
+                    ) : (
+                        <div className="empty-state-panel"><FileText size={28} /><h2>No bill selected</h2><p>Choose a bill from the list or add a new one.</p></div>
+                    )}
+                </section>
+            </div>
         </div>
     );
 }

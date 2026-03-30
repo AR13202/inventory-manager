@@ -1,24 +1,26 @@
 // src/utils/firebaseHelpers/inventory.ts
 import {
     collection,
+    deleteDoc,
     doc,
+    getDocs,
+    onSnapshot,
+    orderBy,
+    query,
+    serverTimestamp,
     setDoc,
     updateDoc,
-    deleteDoc,
-    onSnapshot,
-    query,
-    orderBy,
-    writeBatch,
-    getDocs,
-    serverTimestamp
+    writeBatch
 } from "firebase/firestore";
 import { db } from "../firebase";
+import type { BillItem, BillProductInfo } from "./bills";
 
 export interface InventoryItem {
     id?: string;
     productId?: string;
     name: string;
     hsn: string;
+    unit?: string;
     quantity: number;
     price: string;
     sku: string;
@@ -28,14 +30,6 @@ export interface InventoryItem {
     createdAt?: string;
     createdBy?: string;
     updatedAt?: string;
-}
-
-export interface InventoryBillProductInput {
-    name: string;
-    hsn?: string;
-    quantity: number | string;
-    price?: number | string;
-    category?: string;
 }
 
 export const determineInventoryStatus = (quantity: number) => {
@@ -61,7 +55,7 @@ export const createInventorySku = (seed?: string) => {
 
 const normalizeQuantity = (value: number | string | undefined) => {
     const parsed = Number(value);
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+    return Number.isFinite(parsed) ? parsed : 0;
 };
 
 const normalizePrice = (value: number | string | undefined) => {
@@ -71,7 +65,40 @@ const normalizePrice = (value: number | string | undefined) => {
     return String(value);
 };
 
-// Add Item
+const getSignedProductMap = (bill?: Partial<BillItem> | null) => {
+    const productMap = new Map<string, BillProductInfo>();
+    const sign = bill?.billType === "Sale" ? -1 : 1;
+
+    (bill?.products || []).forEach((product) => {
+        const name = String(product.name || "").trim();
+        if (!name) {
+            return;
+        }
+
+        const key = name.toLowerCase();
+        const existing = productMap.get(key);
+        const quantity = Math.max(0, normalizeQuantity(product.quantity));
+
+        if (existing) {
+            existing.quantity = normalizeQuantity(existing.quantity) + quantity * sign;
+            if (product.price !== undefined) existing.price = product.price;
+            if (product.hsn) existing.hsn = product.hsn;
+            if (product.category) existing.category = product.category;
+            if (product.unit) existing.unit = product.unit;
+            return;
+        }
+
+        productMap.set(key, {
+            ...product,
+            name,
+            quantity: quantity * sign,
+            category: product.category || "Trade"
+        });
+    });
+
+    return productMap;
+};
+
 export const addInventoryItem = async (orgId: string, itemData: InventoryItem, creatorUid: string) => {
     try {
         const inventoryRef = collection(db, "organizations", orgId, "inventory");
@@ -95,7 +122,6 @@ export const addInventoryItem = async (orgId: string, itemData: InventoryItem, c
     }
 };
 
-// Add Bulk Items
 export const addBulkInventoryItems = async (orgId: string, bulkItems: InventoryItem[], userId: string) => {
     try {
         const batch = writeBatch(db);
@@ -110,7 +136,6 @@ export const addBulkInventoryItems = async (orgId: string, bulkItems: InventoryI
 
         bulkItems.forEach((item) => {
             const existingItem = existingItemsMap.get(item.name.toLowerCase());
-
             if (existingItem && existingItem.id) {
                 const newQuantity = Math.max(0, Number(existingItem.quantity) + Number(item.quantity));
                 const autoStatus = determineInventoryStatus(newQuantity);
@@ -119,16 +144,11 @@ export const addBulkInventoryItems = async (orgId: string, bulkItems: InventoryI
                 batch.update(docRef, {
                     quantity: newQuantity,
                     hsn: item.hsn || existingItem.hsn || "",
+                    unit: item.unit || existingItem.unit || "",
                     price: item.price || existingItem.price || "",
                     category: item.category || existingItem.category || "Trade",
                     ...autoStatus,
                     updatedAt: serverTimestamp()
-                });
-                existingItemsMap.set(item.name.toLowerCase(), {
-                    ...existingItem,
-                    ...item,
-                    quantity: newQuantity,
-                    ...autoStatus
                 });
                 return;
             }
@@ -148,14 +168,6 @@ export const addBulkInventoryItems = async (orgId: string, bulkItems: InventoryI
                 createdAt: serverTimestamp(),
                 updatedAt: serverTimestamp()
             });
-            existingItemsMap.set(item.name.toLowerCase(), {
-                ...item,
-                ...autoStatus,
-                id: newDocRef.id,
-                productId: item.productId || newDocRef.id,
-                sku: item.sku || createInventorySku(item.name),
-                quantity
-            });
         });
 
         await batch.commit();
@@ -167,8 +179,25 @@ export const addBulkInventoryItems = async (orgId: string, bulkItems: InventoryI
 
 export const syncInventoryFromBill = async (
     orgId: string,
-    products: InventoryBillProductInput[],
-    billType: "Purchase" | "Sale" | "Sell",
+    bill: Pick<BillItem, "billType" | "products">,
+    userId: string
+) => {
+    return applyInventoryDelta(orgId, null, bill, userId);
+};
+
+export const reconcileInventoryForBillUpdate = async (
+    orgId: string,
+    previousBill: Pick<BillItem, "billType" | "products">,
+    nextBill: Pick<BillItem, "billType" | "products">,
+    userId: string
+) => {
+    return applyInventoryDelta(orgId, previousBill, nextBill, userId);
+};
+
+const applyInventoryDelta = async (
+    orgId: string,
+    previousBill: Pick<BillItem, "billType" | "products"> | null,
+    nextBill: Pick<BillItem, "billType" | "products"> | null,
     userId: string
 ) => {
     try {
@@ -182,50 +211,35 @@ export const syncInventoryFromBill = async (
             existingItemsMap.set(data.name.toLowerCase(), { ...data, id: itemDoc.id });
         });
 
-        const aggregatedItems = new Map<string, InventoryBillProductInput>();
-        products.forEach((product) => {
-            const normalizedName = String(product.name || "").trim();
-            if (!normalizedName) {
+        const previousMap = getSignedProductMap(previousBill);
+        const nextMap = getSignedProductMap(nextBill);
+        const allKeys = new Set<string>([...previousMap.keys(), ...nextMap.keys()]);
+
+        allKeys.forEach((key) => {
+            const previous = previousMap.get(key);
+            const next = nextMap.get(key);
+            const previousSignedQuantity = normalizeQuantity(previous?.quantity);
+            const nextSignedQuantity = normalizeQuantity(next?.quantity);
+            const delta = nextSignedQuantity - previousSignedQuantity;
+            const reference = next || previous;
+
+            if (!reference || delta === 0) {
                 return;
             }
 
-            const key = normalizedName.toLowerCase();
-            const existingProduct = aggregatedItems.get(key);
-            if (existingProduct) {
-                existingProduct.quantity = normalizeQuantity(existingProduct.quantity) + normalizeQuantity(product.quantity);
-                existingProduct.price = product.price ?? existingProduct.price;
-                existingProduct.hsn = product.hsn || existingProduct.hsn || "";
-                existingProduct.category = product.category || existingProduct.category || "Trade";
-                return;
-            }
-
-            aggregatedItems.set(key, {
-                name: normalizedName,
-                quantity: normalizeQuantity(product.quantity),
-                price: product.price,
-                hsn: product.hsn || "",
-                category: product.category || "Trade"
-            });
-        });
-
-        aggregatedItems.forEach((item, key) => {
             const existingItem = existingItemsMap.get(key);
-            const requestedQuantity = normalizeQuantity(item.quantity);
-            const isPurchase = billType === "Purchase";
-
             if (existingItem && existingItem.id) {
                 const currentQuantity = Number(existingItem.quantity) || 0;
-                const nextQuantity = isPurchase
-                    ? currentQuantity + requestedQuantity
-                    : Math.max(0, currentQuantity - requestedQuantity);
+                const nextQuantity = Math.max(0, currentQuantity + delta);
                 const autoStatus = determineInventoryStatus(nextQuantity);
                 const docRef = doc(db, "organizations", orgId, "inventory", existingItem.id);
 
                 batch.update(docRef, {
-                    name: item.name,
-                    hsn: item.hsn || existingItem.hsn || "",
-                    category: item.category || existingItem.category || "Trade",
-                    price: normalizePrice(item.price ?? existingItem.price),
+                    name: reference.name,
+                    hsn: reference.hsn || existingItem.hsn || "",
+                    unit: reference.unit || existingItem.unit || "",
+                    category: reference.category || existingItem.category || "Trade",
+                    price: normalizePrice(reference.price ?? existingItem.price),
                     quantity: nextQuantity,
                     ...autoStatus,
                     updatedAt: serverTimestamp()
@@ -234,18 +248,19 @@ export const syncInventoryFromBill = async (
             }
 
             const newDocRef = doc(orgInventoryRef);
-            const initialQuantity = isPurchase ? requestedQuantity : 0;
+            const initialQuantity = Math.max(0, delta);
             const autoStatus = determineInventoryStatus(initialQuantity);
 
             batch.set(newDocRef, {
                 id: newDocRef.id,
                 productId: newDocRef.id,
-                name: item.name,
-                hsn: item.hsn || "",
+                name: reference.name,
+                hsn: reference.hsn || "",
+                unit: reference.unit || "",
                 quantity: initialQuantity,
-                price: normalizePrice(item.price),
-                sku: createInventorySku(item.name),
-                category: item.category || "Trade",
+                price: normalizePrice(reference.price),
+                sku: createInventorySku(reference.name),
+                category: reference.category || "Trade",
                 ...autoStatus,
                 createdBy: userId,
                 createdAt: serverTimestamp(),
@@ -260,7 +275,6 @@ export const syncInventoryFromBill = async (
     }
 };
 
-// Update Item
 export const updateInventoryItem = async (orgId: string, itemId: string, updates: Partial<InventoryItem>) => {
     try {
         const quantity = typeof updates.quantity === "number" ? updates.quantity : undefined;
@@ -278,7 +292,6 @@ export const updateInventoryItem = async (orgId: string, itemId: string, updates
     }
 };
 
-// Delete Item
 export const deleteInventoryItem = async (orgId: string, itemId: string) => {
     try {
         const itemRef = doc(db, "organizations", orgId, "inventory", itemId);
@@ -289,7 +302,6 @@ export const deleteInventoryItem = async (orgId: string, itemId: string) => {
     }
 };
 
-// Subscribe to Inventory (Real-time listener)
 export const subscribeToInventory = (orgId: string, callback: (items: InventoryItem[]) => void) => {
     const inventoryRef = collection(db, "organizations", orgId, "inventory");
     const q = query(inventoryRef, orderBy("createdAt", "desc"));

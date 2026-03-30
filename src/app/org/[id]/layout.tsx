@@ -67,13 +67,16 @@ export default function OrgLayout({
 
                 <nav style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
                     <Link href={`/org/${activeOrg.orgId}`} style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '12px', borderRadius: '8px', transition: 'var(--transition)' }} className="table-row-hover">
+                        <Home size={18} /> Home
+                    </Link>
+                    <Link href={`/org/${activeOrg.orgId}/inventory`} style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '12px', borderRadius: '8px', transition: 'var(--transition)' }} className="table-row-hover">
                         <Box size={18} /> Inventory
                     </Link>
                     <Link href={`/org/${activeOrg.orgId}/companies`} style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '12px', borderRadius: '8px', transition: 'var(--transition)' }} className="table-row-hover">
-                        <Home size={18} /> Companies
+                        <FileText size={18} /> Companies
                     </Link>
                     <Link href={`/org/${activeOrg.orgId}/bills`} style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '12px', borderRadius: '8px', transition: 'var(--transition)' }} className="table-row-hover">
-                        <FileText size={18} /> Bills
+                        <Box size={18} /> Bills
                     </Link>
                     <Link href={`/org/${activeOrg.orgId}/users`} style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '12px', borderRadius: '8px', transition: 'var(--transition)' }} className="table-row-hover">
                         <Users size={18} /> Members

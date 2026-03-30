@@ -1,28 +1,35 @@
 // src/utils/firebaseHelpers/bills.ts
 import {
     collection,
-    doc,
-    setDoc,
-    updateDoc,
     deleteDoc,
+    doc,
     onSnapshot,
-    query,
     orderBy,
-    serverTimestamp
+    query,
+    setDoc,
+    updateDoc
 } from "firebase/firestore";
 import { db } from "../firebase";
 
 export interface BillProductInfo {
     name: string;
     quantity: number;
+    unit?: string;
     price: number | string;
     hsn?: string;
     category?: string;
 }
 
+export interface BillTaxDetail {
+    taxType: string;
+    taxPercentage: number | string;
+    taxAmount: number | string;
+}
+
 export interface BillItem {
     id?: string;
-    vendorName: string; // Company Name
+    billNumber: string;
+    vendorName: string;
     vendorGst?: string;
     vendorAddress?: string;
     vendorPhone?: string;
@@ -30,52 +37,58 @@ export interface BillItem {
     ledgerEntryId?: string;
     products: BillProductInfo[];
     taxAmount: string | number;
-    taxDetails?: { taxType: string; taxPercentage: number | string; taxAmount: number | string }[];
+    taxDetails?: BillTaxDetail[];
     freightAndForwardingCharges?: number | string;
     roundOff?: number | string;
     grossAmount: string | number;
-    amount: string | number; // Total price with tax
-    billType: "Purchase" | "Sale" | "Sell";
+    amount: string | number;
+    billType: "Purchase" | "Sale";
     isScanned?: boolean;
-    photoUrl?: string; // Stored URL if scanned
+    photoUrl?: string;
     photoPublicId?: string;
+    photoResourceType?: "image" | "raw" | "video";
+    fileName?: string;
+    fileMimeType?: string;
+    fileHash?: string;
     date: string;
     createdAt?: string;
     createdBy?: string;
+    updatedAt?: string;
 }
 
-// Add Bill
 export const addBillItem = async (orgId: string, itemData: BillItem, creatorUid: string) => {
     try {
         const billsRef = collection(db, "organizations", orgId, "bills");
         const docRef = doc(billsRef);
+        const timestamp = new Date().toISOString();
 
-        const newItem = {
+        await setDoc(docRef, {
             ...itemData,
             id: docRef.id,
-            createdAt: new Date().toISOString(),
+            createdAt: timestamp,
+            updatedAt: timestamp,
             createdBy: creatorUid
-        };
+        });
 
-        await setDoc(docRef, newItem);
         return { id: docRef.id, error: null };
     } catch (error: any) {
         return { id: null, error: error.message };
     }
 };
 
-// Update Bill
 export const updateBillItem = async (orgId: string, itemId: string, updates: Partial<BillItem>) => {
     try {
         const itemRef = doc(db, "organizations", orgId, "bills", itemId);
-        await updateDoc(itemRef, updates);
+        await updateDoc(itemRef, {
+            ...updates,
+            updatedAt: new Date().toISOString()
+        });
         return { success: true, error: null };
     } catch (error: any) {
         return { success: false, error: error.message };
     }
 };
 
-// Delete Bill
 export const deleteBillItem = async (orgId: string, itemId: string) => {
     try {
         const itemRef = doc(db, "organizations", orgId, "bills", itemId);
@@ -86,15 +99,14 @@ export const deleteBillItem = async (orgId: string, itemId: string) => {
     }
 };
 
-// Subscribe to Bills (Real-time listener)
 export const subscribeToBills = (orgId: string, callback: (items: BillItem[]) => void) => {
     const billsRef = collection(db, "organizations", orgId, "bills");
     const q = query(billsRef, orderBy("createdAt", "desc"));
 
     const unsubscribe = onSnapshot(q, (snapshot) => {
         const items: BillItem[] = [];
-        snapshot.forEach((doc) => {
-            items.push(doc.data() as BillItem);
+        snapshot.forEach((billDoc) => {
+            items.push(billDoc.data() as BillItem);
         });
         callback(items);
     }, (error) => {

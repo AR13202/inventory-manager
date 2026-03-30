@@ -13,8 +13,10 @@ cloudinary.config({
 
 export async function GET(request: NextRequest) {
     const publicId = request.nextUrl.searchParams.get("publicId");
+    const resourceType = request.nextUrl.searchParams.get("resourceType") || "image";
+
     if (!publicId || !publicId.startsWith("inventory_bills/")) {
-        return NextResponse.json({ error: "Invalid image reference." }, { status: 400 });
+        return NextResponse.json({ error: "Invalid file reference." }, { status: 400 });
     }
 
     if (!cloudName || !apiKey || !apiSecret) {
@@ -25,7 +27,8 @@ export async function GET(request: NextRequest) {
         secure: true,
         sign_url: true,
         type: "authenticated",
-        resource_type: "image"
+        resource_type: resourceType as "image" | "raw" | "video",
+        attachment: false
     });
 
     return NextResponse.redirect(signedUrl);

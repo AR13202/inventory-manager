@@ -191,9 +191,12 @@ button {
 .nav-links {
   display: flex;
   gap: 24px;
+  align-items: center;
 }
 
 .nav-link {
+  display: inline-flex;
+  align-items: center;
   font-weight: 500;
   opacity: 0.8;
   transition: var(--transition);

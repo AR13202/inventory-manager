@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useEffect, useMemo, useState } from "react";
-import { Building2, CreditCard, FileText, Plus, Search, X } from "lucide-react";
+import { Building2, CreditCard, FileText, Plus, Search } from "lucide-react";
 import { useAuth } from "@/context/AuthContext";
 import { useOrg } from "@/context/OrgContext";
 import {
@@ -55,6 +55,8 @@ export default function CompaniesPage() {
 
     const selectedCompany = useMemo(() => companies.find((company) => company.id === selectedCompanyId) || companies[0] || null, [companies, selectedCompanyId]);
     const ledgerRows = activeTab === "purchaseLedger" ? purchaseLedger : salesLedger;
+    const totalDebit = [...purchaseLedger, ...salesLedger].reduce((sum, entry) => sum + Number(entry.debit || 0), 0);
+    const totalCredit = [...purchaseLedger, ...salesLedger].reduce((sum, entry) => sum + Number(entry.credit || 0), 0);
     const filteredCompanies = useMemo(() => companies.filter((company) => {
         const q = query.toLowerCase();
         if (!q) return true;
@@ -170,16 +172,23 @@ export default function CompaniesPage() {
                                 </div>
                             </div>
 
+                            <div className="bill-section">
+                                <div className="detail-pair-grid">
+                                    <div><span className="detail-label">Total Debit</span><strong>{formatCurrencyINR(totalDebit)}</strong></div>
+                                    <div><span className="detail-label">Total Credit</span><strong>{formatCurrencyINR(totalCredit)}</strong></div>
+                                </div>
+                            </div>
+
                             <div className="bill-section" style={{ padding: 0, overflow: "hidden" }}>
                                 <table style={{ width: "100%", borderCollapse: "collapse" }}>
                                     <thead style={{ background: "var(--border-color)" }}>
                                         <tr>
-                                            {["Date", "Bill Number", "Debit", "Credit", "Amount", "Gateway"].map((label) => <th key={label} style={{ padding: "14px 16px", textAlign: "left" }}>{label}</th>)}
+                                            {["Date", "Bill Number", "Debit", "Credit", "Amount"].map((label) => <th key={label} style={{ padding: "14px 16px", textAlign: "left" }}>{label}</th>)}
                                         </tr>
                                     </thead>
                                     <tbody>
                                         {ledgerRows.length === 0 ? (
-                                            <tr><td colSpan={6} style={{ padding: "24px 16px", opacity: 0.7 }}>No {activeTab === "purchaseLedger" ? "purchase" : "sales"} entries yet.</td></tr>
+                                            <tr><td colSpan={5} style={{ padding: "24px 16px", opacity: 0.7 }}>No {activeTab === "purchaseLedger" ? "purchase" : "sales"} entries yet.</td></tr>
                                         ) : ledgerRows.map((entry) => (
                                             <tr key={entry.id} style={{ borderBottom: "1px solid var(--border-color)" }}>
                                                 <td style={{ padding: "14px 16px" }}>{entry.date}</td>
@@ -195,7 +204,6 @@ export default function CompaniesPage() {
                                                 <td style={{ padding: "14px 16px" }}>{formatCurrencyINR(entry.debit)}</td>
                                                 <td style={{ padding: "14px 16px" }}>{formatCurrencyINR(entry.credit)}</td>
                                                 <td style={{ padding: "14px 16px", fontWeight: 700 }}>{formatCurrencyINR(entry.amount)}</td>
-                                                <td style={{ padding: "14px 16px" }}>{entry.gateway || (entry.entryKind === "bill" ? "Bill" : "-")}</td>
                                             </tr>
                                         ))}
                                     </tbody>

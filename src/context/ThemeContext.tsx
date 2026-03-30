@@ -11,7 +11,7 @@ interface ThemeContextType {
 }
 
 const ThemeContext = createContext<ThemeContextType>({
-    theme: "dark",
+    theme: "light",
     setTheme: () => { },
     toggleTheme: () => { }
 });
@@ -19,11 +19,11 @@ const ThemeContext = createContext<ThemeContextType>({
 const STORAGE_KEY = "inventory-manager-theme";
 
 export const ThemeProvider = ({ children }: { children: React.ReactNode }) => {
-    const [theme, setThemeState] = useState<Theme>("dark");
+    const [theme, setThemeState] = useState<Theme>("light");
 
     useEffect(() => {
         const storedTheme = window.localStorage.getItem(STORAGE_KEY) as Theme | null;
-        const resolvedTheme = storedTheme || "dark";
+        const resolvedTheme = storedTheme || "light";
         setThemeState(resolvedTheme);
         document.documentElement.setAttribute("data-theme", resolvedTheme);
     }, []);

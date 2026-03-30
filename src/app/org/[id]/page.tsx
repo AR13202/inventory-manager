@@ -157,10 +157,19 @@ export default function OrgHomePage() {
     return (
         <div>
             <header className="dashboard-header flex-between" style={{ marginTop: 0, alignItems: "flex-start" }}>
-                <div>
+                <div style={{ display: "flex", gap: "14px", alignItems: "center" }}>
+                    {activeOrg.logoPublicId && (
+                        <img
+                            src={`/api/bills/file?publicId=${encodeURIComponent(activeOrg.logoPublicId)}&resourceType=${encodeURIComponent(activeOrg.logoResourceType || "image")}`}
+                            alt={`${activeOrg.name} logo`}
+                            style={{ width: "62px", height: "62px", objectFit: "cover", borderRadius: "16px" }}
+                        />
+                    )}
+                    <div>
                     <p className="section-kicker">Organization Home</p>
                     <h1 className="dashboard-title">{activeOrg.name}</h1>
                     <p className="dashboard-subtitle">Overview for {formatMonthYear(new Date())}</p>
+                    </div>
                 </div>
                 <div style={{ display: "flex", gap: "12px" }}>
                     <button type="button" className="btn-secondary" onClick={() => setShowProfileForm((current) => !current)}>

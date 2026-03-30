@@ -158,7 +158,20 @@ export default function Dashboard() {
                 }}
               >
                 <div className="flex-between">
-                  <h3 style={{ fontSize: '1.25rem' }}>{org.name}</h3>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                    {org.logoPublicId ? (
+                      <img
+                        src={`/api/bills/file?publicId=${encodeURIComponent(org.logoPublicId)}&resourceType=${encodeURIComponent(org.logoResourceType || "image")}`}
+                        alt={`${org.name} logo`}
+                        style={{ width: '44px', height: '44px', objectFit: 'cover', borderRadius: '12px' }}
+                      />
+                    ) : (
+                      <div style={{ width: '44px', height: '44px', borderRadius: '12px', background: 'var(--surface-elevated)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                        <Box size={18} />
+                      </div>
+                    )}
+                    <h3 style={{ fontSize: '1.25rem' }}>{org.name}</h3>
+                  </div>
                   {org.adminUid === user.uid && (
                     <span style={{ fontSize: '0.75rem', padding: '4px 8px', background: 'var(--primary-color)', color: 'white', borderRadius: '4px', fontWeight: 600 }}>ADMIN</span>
                   )}

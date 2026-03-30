@@ -334,7 +334,7 @@ export default function InventoryView() {
                                 <tr><td colSpan={8} style={{ padding: '48px', textAlign: 'center', opacity: 0.6 }}>No inventory items match your search.</td></tr>
                             ) : (
                                 filteredAndSortedItems.map((item, i) => (
-                                    <tr key={item.id} style={{ borderBottom: i < filteredAndSortedItems.length - 1 ? '1px solid var(--border-color)' : 'none', transition: 'var(--transition)' }} className="table-row-hover">
+                                    <tr key={item.id || i} style={{ borderBottom: i < filteredAndSortedItems.length - 1 ? '1px solid var(--border-color)' : 'none', transition: 'var(--transition)' }} className="table-row-hover">
                                         <td style={{ padding: '16px 24px', fontWeight: 500 }}>{item.name}</td>
                                         <td style={{ padding: '16px 24px', fontFamily: 'var(--font-geist-mono)', fontSize: '0.875rem', opacity: 0.8 }}>{item.hsn}</td>
                                         <td style={{ padding: '16px 24px' }}>{item.quantity}</td>

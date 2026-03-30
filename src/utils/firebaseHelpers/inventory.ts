@@ -78,6 +78,7 @@ export const addBulkInventoryItems = async (orgId: string, bulkItems: InventoryI
                 const newDocRef = doc(orgInventoryRef);
                 batch.set(newDocRef, {
                     ...item,
+                    id: newDocRef.id,
                     createdBy: userId,
                     createdAt: serverTimestamp(),
                     updatedAt: serverTimestamp()
@@ -122,7 +123,8 @@ export const subscribeToInventory = (orgId: string, callback: (items: InventoryI
     const unsubscribe = onSnapshot(q, (snapshot) => {
         const items: InventoryItem[] = [];
         snapshot.forEach((doc) => {
-            items.push(doc.data() as InventoryItem);
+            const data = doc.data() as InventoryItem;
+            items.push({ ...data, id: doc.id });
         });
         callback(items);
     }, (error) => {

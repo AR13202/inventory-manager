@@ -5,7 +5,7 @@ import { useOrg } from "@/context/OrgContext";
 import { useRouter } from "next/navigation";
 import React, { useEffect } from "react";
 import Link from "next/link";
-import { Settings, Users, Box, Home } from "lucide-react";
+import { Settings, Users, Box, Home, FileText } from "lucide-react";
 
 export default function OrgLayout({
     children,
@@ -71,6 +71,9 @@ export default function OrgLayout({
                     </Link>
                     <Link href={`/org/${activeOrg.orgId}/companies`} style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '12px', borderRadius: '8px', transition: 'var(--transition)' }} className="table-row-hover">
                         <Home size={18} /> Companies
+                    </Link>
+                    <Link href={`/org/${activeOrg.orgId}/bills`} style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '12px', borderRadius: '8px', transition: 'var(--transition)' }} className="table-row-hover">
+                        <FileText size={18} /> Bills
                     </Link>
                     <Link href={`/org/${activeOrg.orgId}/users`} style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '12px', borderRadius: '8px', transition: 'var(--transition)' }} className="table-row-hover">
                         <Users size={18} /> Members

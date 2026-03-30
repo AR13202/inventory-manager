@@ -11,9 +11,20 @@ import {
     updateBillItem,
     deleteBillItem
 } from "@/utils/firebaseHelpers/bills";
-import { addBulkInventoryItems, subscribeToInventory, InventoryItem } from "@/utils/firebaseHelpers/inventory";
-import { addCompanyItem, Company } from "@/utils/firebaseHelpers/companies";
+import { syncInventoryFromBill, subscribeToInventory, InventoryItem } from "@/utils/firebaseHelpers/inventory";
+import { addCompanyLedgerEntry, ensureCompanyProfile, updateCompanyLedgerEntry } from "@/utils/firebaseHelpers/companies";
 import { scanReceipt } from "@/utils/geminiScanner";
+
+const normalizeBillType = (billType?: string): "Purchase" | "Sale" => {
+    return billType === "Sale" || billType === "Sell" ? "Sale" : "Purchase";
+};
+
+const getBillImageSrc = (bill?: Partial<BillItem> | null) => {
+    if (bill?.photoPublicId) {
+        return `/api/bills/image?publicId=${encodeURIComponent(bill.photoPublicId)}`;
+    }
+    return bill?.photoUrl || null;
+};
 
 export default function BillsView({ params }: { params: Promise<{ id: string }> }) {
     const { user } = useAuth();
@@ -84,10 +95,11 @@ export default function BillsView({ params }: { params: Promise<{ id: string }> 
             setEditingId(bill.id as string);
             setFormData({
                 ...bill,
+                billType: normalizeBillType(bill.billType),
                 taxDetails: Array.isArray(bill.taxDetails) ? bill.taxDetails : []
             });
             setParsedCompanies(null);
-            setScannedImage(bill.photoUrl || null);
+            setScannedImage(getBillImageSrc(bill));
         } else {
             setEditingId(null);
             setFormData({
@@ -183,80 +195,84 @@ export default function BillsView({ params }: { params: Promise<{ id: string }> 
             const reader = new FileReader();
             reader.readAsDataURL(file);
             reader.onload = async () => {
-                const base64Data = reader.result as string;
-                setScannedImage(base64Data);
+                try {
+                    const base64Data = reader.result as string;
+                    setScannedImage(base64Data);
 
-                // Call Gemini to parse
-                const parsedData = await scanReceipt(base64Data);
-                if (parsedData) {
+                    const parsedData = await scanReceipt(base64Data);
+                    const parsedBillType = parsedData.billType === "Unknown"
+                        ? normalizeBillType(formData.billType)
+                        : normalizeBillType(parsedData.billType);
+                    const matchedCompany = parsedBillType === "Purchase"
+                        ? parsedData.parentCompanyDetails
+                        : parsedData.customerCompanyDetails;
 
-                    // Logic to use Parent or Customer depending on category. Default assumption: if vendor is generating bill, and we are paying it, it's a purchase. 
-                    const billCategory = formData.billType || "Purchase";
-                    let matchedCompany = null;
-
-                    if (billCategory === "Purchase") {
-                        matchedCompany = parsedData.parentCompanyDetails;
-                    } else {
-                        matchedCompany = parsedData.customerCompanyDetails;
-                    }
-
-                    // Save to state so user can flip them dynamically
                     setParsedCompanies({
                         parent: parsedData.parentCompanyDetails,
                         customer: parsedData.customerCompanyDetails
                     });
 
-                    let rawProducts = parsedData.items && parsedData.items.length > 0 ? parsedData.items : formData.products;
-                    const enrichedProducts = rawProducts.map((p: any) => {
-                        const found = inventoryItems.find(inv => inv.name.toLowerCase() === p.name?.toLowerCase());
+                    const rawProducts = parsedData.items && parsedData.items.length > 0
+                        ? parsedData.items
+                        : formData.products || [];
+                    const enrichedProducts = rawProducts.map((product: any) => {
+                        const found = inventoryItems.find((item) => item.name.toLowerCase() === product.name?.toLowerCase());
                         return {
-                            ...p,
-                            name: p.name || "",
-                            quantity: p.quantity || 1,
-                            price: p.price || 0,
-                            hsn: p.hsn || found?.hsn || "",
-                            category: found ? found.category : (p.category || "Trade")
+                            ...product,
+                            name: product.name || "",
+                            quantity: Number(product.quantity || 1),
+                            price: Number(product.price || 0),
+                            hsn: product.hsn || found?.hsn || "",
+                            category: found?.category || product.category || "Trade"
                         };
                     });
-
-                    const hasMissingDetails = enrichedProducts.some((p: any) => !p.name || !p.hsn || !p.quantity);
+                    const hasMissingDetails = enrichedProducts.some((product: any) => !product.name || !product.hsn || !product.quantity);
+                    const grossAmount = enrichedProducts.reduce(
+                        (sum: number, product: any) => sum + (Number(product.quantity || 0) * Number(product.price || 0)),
+                        0
+                    );
+                    const parsedTaxes = Array.isArray(parsedData.taxDetails)
+                        ? parsedData.taxDetails.map((tax: any) => ({
+                            taxType: tax.taxType || "Tax",
+                            taxPercentage: tax.taxPercentage || parsedData.taxPercentage || 0,
+                            taxAmount: Number(tax.taxAmount || 0)
+                        }))
+                        : [];
+                    const taxAmount = parsedTaxes.reduce((sum: number, tax: any) => sum + Number(tax.taxAmount || 0), 0);
 
                     if (hasMissingDetails) {
                         setPendingScannedProducts(enrichedProducts);
                         setShowPendingProductsModal(true);
                     }
 
-                    // Pre-fill form
-                    setFormData({
-                        ...formData,
-                        vendorName: (matchedCompany?.name && matchedCompany.name.trim() !== "") ? matchedCompany.name : formData.vendorName,
+                    setFormData((current) => ({
+                        ...current,
+                        vendorName: matchedCompany?.name?.trim() ? matchedCompany.name : current.vendorName,
                         vendorGst: matchedCompany?.gst || "",
                         vendorAddress: matchedCompany?.address || "",
                         vendorPhone: matchedCompany?.phoneNumbers || "",
-                        taxAmount: parsedData.taxAmount || formData.taxAmount || 0,
-                        taxDetails: Array.isArray(parsedData.taxDetails) ? parsedData.taxDetails.map((t: any) => ({
-                            taxType: t.taxType || 'Tax',
-                            taxPercentage: t.taxPercentage || parsedData.taxPercentage || 0,
-                            taxAmount: t.taxAmount || 0
-                        })) : (Array.isArray(formData.taxDetails) ? formData.taxDetails : []),
-                        freightAndForwardingCharges: parsedData.freightAndForwardingCharges || formData.freightAndForwardingCharges || 0,
-                        roundOff: parsedData.roundOff || formData.roundOff || 0,
-                        amount: parsedData.totalAmount || formData.amount || 0,
-                        products: hasMissingDetails ? (formData.products || []) : enrichedProducts,
+                        billType: parsedBillType,
+                        grossAmount,
+                        taxAmount,
+                        taxDetails: parsedTaxes,
+                        freightAndForwardingCharges: Number(parsedData.freightAndForwardingCharges || 0),
+                        roundOff: Number(parsedData.roundOff || 0),
+                        amount: Number(parsedData.totalAmount || grossAmount + taxAmount),
+                        products: hasMissingDetails ? (current.products || []) : enrichedProducts,
                         isScanned: true,
                         photoUrl: base64Data,
+                        photoPublicId: "",
                         date: parsedData.date || new Date().toISOString().split("T")[0]
-                    });
+                    }));
 
-                    // Check for missing items that might block DB generation if empty
                     if (!matchedCompany?.name || !matchedCompany?.gst || !matchedCompany?.address) {
-                        setError(`Notice: Found missing company details (Name, GST, or Address). Please fill them in the form. Automatically generated entries might be incomplete.`);
+                        setError("Notice: some company details were missing in the scanned bill. Please review name, GST, and address before saving.");
                     }
-
-                } else {
-                    setError("Failed to parse the receipt. Please enter manually.");
+                } catch (scanError: any) {
+                    setError(scanError.message || "Failed to parse the receipt. Please enter the bill manually.");
+                } finally {
+                    setScanning(false);
                 }
-                setScanning(false);
             };
         } catch (err: any) {
             setError(err.message || "Error reading file");
@@ -269,82 +285,141 @@ export default function BillsView({ params }: { params: Promise<{ id: string }> 
         setError("");
         setActionLoading(true);
 
-        if (!activeOrg || !user) return;
+        if (!activeOrg || !user) {
+            setActionLoading(false);
+            return;
+        }
 
         try {
             let finalPhotoUrl = formData.photoUrl;
+            let finalPhotoPublicId = formData.photoPublicId;
+            const normalizedBillType = normalizeBillType(formData.billType);
+            const normalizedAmount = Number(formData.amount || 0);
+            const normalizedProducts = (formData.products || []).map((product) => ({
+                ...product,
+                name: String(product.name || "").trim(),
+                quantity: Number(product.quantity || 0),
+                price: Number(product.price || 0),
+                hsn: product.hsn || "",
+                category: product.category || "Trade"
+            }));
 
-            // Upload to Cloudinary if it's a new local base64 scan
-            if (formData.isScanned && finalPhotoUrl && finalPhotoUrl.startsWith('data:image')) {
-                const res = await fetch('/api/upload', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+            if (formData.isScanned && finalPhotoUrl && finalPhotoUrl.startsWith("data:image")) {
+                const res = await fetch("/api/upload", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({ image: finalPhotoUrl }),
                 });
                 const data = await res.json();
                 if (data.success) {
                     finalPhotoUrl = data.url;
+                    finalPhotoPublicId = data.publicId;
                 } else {
-                    console.error("Cloudinary Error:", data.error);
+                    throw new Error(data.error || "Unable to upload the bill image.");
                 }
             }
 
             if (editingId) {
                 const { error: updateError } = await updateBillItem(activeOrg.orgId, editingId, {
-                    ...formData, photoUrl: finalPhotoUrl
+                    ...formData,
+                    billType: normalizedBillType,
+                    products: normalizedProducts,
+                    photoUrl: finalPhotoUrl,
+                    photoPublicId: finalPhotoPublicId
                 } as BillItem);
                 if (updateError) throw new Error(updateError);
-            } else {
-                const billItemToSave = { ...formData };
-                delete (billItemToSave as any).vendorGst;
-                delete (billItemToSave as any).vendorAddress;
-                delete (billItemToSave as any).vendorPhone;
 
-                const { error: addError } = await addBillItem(activeOrg.orgId, {
-                    ...billItemToSave,
+                if (formData.companyId && formData.ledgerEntryId) {
+                    const ledgerType = normalizedBillType === "Purchase" ? "purchaseLedger" : "salesLedger";
+                    const { error: ledgerError } = await updateCompanyLedgerEntry(
+                        activeOrg.orgId,
+                        formData.companyId,
+                        ledgerType,
+                        formData.ledgerEntryId,
+                        {
+                            billType: normalizedBillType,
+                            date: formData.date || new Date().toISOString().split("T")[0],
+                            amount: normalizedAmount,
+                            credit: normalizedBillType === "Sale" ? normalizedAmount : 0,
+                            debit: normalizedBillType === "Purchase" ? normalizedAmount : 0,
+                            companyName: formData.vendorName || "",
+                            billImageUrl: finalPhotoUrl,
+                            billImagePublicId: finalPhotoPublicId
+                        }
+                    );
+                    if (ledgerError) {
+                        throw new Error(ledgerError);
+                    }
+                }
+            } else {
+                const { id: billId, error: addError } = await addBillItem(activeOrg.orgId, {
+                    ...formData,
+                    billType: normalizedBillType,
+                    products: normalizedProducts,
                     photoUrl: finalPhotoUrl,
+                    photoPublicId: finalPhotoPublicId,
                     createdBy: user.uid
                 } as BillItem, user.uid);
                 if (addError) throw new Error(addError);
 
-                // Also create the Company automatically so they don't switch tabs
-                if (formData.vendorName) {
-                    await addCompanyItem(activeOrg.orgId, {
-                        name: formData.vendorName,
+                let companyId = "";
+                let ledgerEntryId = "";
+
+                if (formData.vendorName?.trim()) {
+                    const companyResult = await ensureCompanyProfile(activeOrg.orgId, {
+                        name: formData.vendorName.trim(),
                         createdBy: user.uid,
                         address: formData.vendorAddress || "",
                         gst: formData.vendorGst || "",
                         phoneNumbers: formData.vendorPhone || ""
                     });
+
+                    if (companyResult.error) {
+                        throw new Error(companyResult.error);
+                    }
+
+                    companyId = companyResult.id || "";
+                    if (companyId && billId) {
+                        const ledgerType = normalizedBillType === "Purchase" ? "purchaseLedger" : "salesLedger";
+                        const ledgerResult = await addCompanyLedgerEntry(activeOrg.orgId, companyId, ledgerType, {
+                            billId,
+                            billType: normalizedBillType,
+                            date: formData.date || new Date().toISOString().split("T")[0],
+                            credit: normalizedBillType === "Sale" ? normalizedAmount : 0,
+                            debit: normalizedBillType === "Purchase" ? normalizedAmount : 0,
+                            amount: normalizedAmount,
+                            billImageUrl: finalPhotoUrl,
+                            billImagePublicId: finalPhotoPublicId,
+                            companyName: formData.vendorName.trim()
+                        });
+
+                        if (ledgerResult.error) {
+                            throw new Error(ledgerResult.error);
+                        }
+                        ledgerEntryId = ledgerResult.id || "";
+                    }
                 }
 
-                // Add/Update products in inventory based on BillType
-                if (formData.products && formData.products.length > 0) {
-                    const existingItemsMap = new Map();
-                    inventoryItems.forEach(item => existingItemsMap.set(item.name.toLowerCase(), item));
-
-                    const inventoryItemsPayload = formData.products.map(p => {
-                        const existing = existingItemsMap.get(p.name.toLowerCase());
-
-                        let qtyDelta = formData.billType === "Purchase" ? Number(p.quantity) : -Number(p.quantity);
-                        if (!existing && formData.billType === "Sell") {
-                            // If product didn't exist, technically we sold 0 of an invisible stock.
-                            // To prevent new random items starting at -X, start them at 0.
-                            qtyDelta = 0;
-                        }
-
-                        return {
-                            name: p.name,
-                            hsn: p.hsn || existing?.hsn || "",
-                            quantity: qtyDelta,
-                            price: String(p.price),
-                            sku: existing?.sku || ("SKU-" + Math.random().toString(36).substring(2, 10).toUpperCase()),
-                            category: p.category || existing?.category || "Trade",
-                            status: "In Stock",
-                            statusColor: "#10b981"
-                        };
+                if (billId && (companyId || ledgerEntryId)) {
+                    const { error: relationError } = await updateBillItem(activeOrg.orgId, billId, {
+                        companyId,
+                        ledgerEntryId
                     });
-                    await addBulkInventoryItems(activeOrg.orgId, inventoryItemsPayload, user.uid);
+                    if (relationError) {
+                        throw new Error(relationError);
+                    }
+                }
+
+                if (normalizedProducts.length > 0) {
+                    const { error: inventoryError } = await syncInventoryFromBill(
+                        activeOrg.orgId,
+                        normalizedProducts,
+                        normalizedBillType,
+                        user.uid
+                    );
+                    if (inventoryError) {
+                        throw new Error(inventoryError);
+                    }
                 }
             }
 
@@ -427,9 +502,9 @@ export default function BillsView({ params }: { params: Promise<{ id: string }> 
                                         <td style={{ padding: '16px 24px' }}>
                                             <span style={{
                                                 padding: '4px 8px', borderRadius: '4px', fontSize: '12px',
-                                                background: b.billType === 'Sell' ? 'rgba(16, 185, 129, 0.2)' : 'rgba(239, 68, 68, 0.2)',
-                                                color: b.billType === 'Sell' ? '#10b981' : '#ef4444'
-                                            }}>{b.billType}</span>
+                                                background: normalizeBillType(b.billType) === 'Sale' ? 'rgba(16, 185, 129, 0.2)' : 'rgba(239, 68, 68, 0.2)',
+                                                color: normalizeBillType(b.billType) === 'Sale' ? '#10b981' : '#ef4444'
+                                            }}>{normalizeBillType(b.billType)}</span>
                                         </td>
                                         <td style={{ padding: '16px 24px', fontWeight: 'bold' }}>₹{b.amount}</td>
                                         <td style={{ padding: '16px 24px', textAlign: 'right' }}>
@@ -504,7 +579,7 @@ export default function BillsView({ params }: { params: Promise<{ id: string }> 
                                 <div style={{ flex: 1 }}>
                                     <label style={{ display: 'block', marginBottom: '8px', fontSize: '0.875rem', fontWeight: 500 }}>Bill Category*</label>
                                     <select value={formData.billType} onChange={e => {
-                                        const newType = e.target.value as "Purchase" | "Sell";
+                                        const newType = e.target.value as "Purchase" | "Sale";
                                         let updates = { billType: newType } as any;
 
                                         if (parsedCompanies && formData.isScanned) {
@@ -518,7 +593,7 @@ export default function BillsView({ params }: { params: Promise<{ id: string }> 
                                         setFormData({ ...formData, ...updates });
                                     }} style={{ width: '100%', padding: '10px 16px', borderRadius: '8px', border: '1px solid var(--border-color)', background: 'var(--surface-color)', color: 'var(--text-color)' }}>
                                         <option value="Purchase">Purchase (Increments Inventory)</option>
-                                        <option value="Sell">Sell (Decrements Inventory)</option>
+                                        <option value="Sale">Sale (Decrements Inventory)</option>
                                     </select>
                                 </div>
                             </div>

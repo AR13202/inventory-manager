@@ -3,11 +3,12 @@
 import React, { useState, useEffect } from "react";
 import { useAuth } from "@/context/AuthContext";
 import { useOrg } from "@/context/OrgContext";
-import { useRouter } from "next/navigation";
-import { Plus, Search, Building2, X, Edit, Trash2 } from "lucide-react";
+import { Plus, Building2, X, Edit, Trash2, FileText } from "lucide-react";
 import {
     Company,
+    CompanyLedgerEntry,
     subscribeToCompanies,
+    subscribeToCompanyLedger,
     addCompanyItem,
     updateCompanyItem,
     deleteCompanyItem
@@ -16,7 +17,6 @@ import {
 export default function CompaniesView({ params }: { params: Promise<{ id: string }> }) {
     const { user } = useAuth();
     const { activeOrg } = useOrg();
-    const router = useRouter();
 
     const [companies, setCompanies] = useState<Company[]>([]);
     const [loading, setLoading] = useState(true);
@@ -28,6 +28,10 @@ export default function CompaniesView({ params }: { params: Promise<{ id: string
     // Modal states
     const [showModal, setShowModal] = useState(false);
     const [editingId, setEditingId] = useState<string | null>(null);
+    const [showLedgerModal, setShowLedgerModal] = useState(false);
+    const [selectedCompany, setSelectedCompany] = useState<Company | null>(null);
+    const [purchaseLedger, setPurchaseLedger] = useState<CompanyLedgerEntry[]>([]);
+    const [salesLedger, setSalesLedger] = useState<CompanyLedgerEntry[]>([]);
     const [formData, setFormData] = useState({
         name: "",
         gst: "",
@@ -50,6 +54,28 @@ export default function CompaniesView({ params }: { params: Promise<{ id: string
 
         return () => unsubscribe();
     }, [user, activeOrg, resolvedParams.id]);
+
+    useEffect(() => {
+        if (!activeOrg || !selectedCompany?.id || !showLedgerModal) return;
+
+        const unsubscribePurchase = subscribeToCompanyLedger(
+            activeOrg.orgId,
+            selectedCompany.id,
+            "purchaseLedger",
+            setPurchaseLedger
+        );
+        const unsubscribeSales = subscribeToCompanyLedger(
+            activeOrg.orgId,
+            selectedCompany.id,
+            "salesLedger",
+            setSalesLedger
+        );
+
+        return () => {
+            unsubscribePurchase();
+            unsubscribeSales();
+        };
+    }, [activeOrg, selectedCompany, showLedgerModal]);
 
     const handleOpenModal = (company?: Company) => {
         if (company) {
@@ -108,6 +134,11 @@ export default function CompaniesView({ params }: { params: Promise<{ id: string
         if (window.confirm(`Are you sure you want to delete ${name}?`)) {
             await deleteCompanyItem(activeOrg.orgId, id);
         }
+    };
+
+    const handleOpenLedger = (company: Company) => {
+        setSelectedCompany(company);
+        setShowLedgerModal(true);
     };
 
     // Filter and Sort Logic
@@ -222,6 +253,9 @@ export default function CompaniesView({ params }: { params: Promise<{ id: string
                                         </td>
                                         <td style={{ padding: '16px 24px', textAlign: 'right' }}>
                                             <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
+                                                <button onClick={() => handleOpenLedger(comp)} className="btn-secondary" style={{ padding: '6px' }} title="View Ledger">
+                                                    <FileText size={16} />
+                                                </button>
                                                 <button onClick={() => handleOpenModal(comp)} className="btn-secondary" style={{ padding: '6px' }} title="Edit">
                                                     <Edit size={16} />
                                                 </button>
@@ -312,6 +346,96 @@ export default function CompaniesView({ params }: { params: Promise<{ id: string
                                 </button>
                             </div>
                         </form>
+                    </div>
+                </div>
+            )}
+
+            {showLedgerModal && selectedCompany && (
+                <div style={{
+                    position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
+                    background: 'rgba(0,0,0,0.6)', zIndex: 120,
+                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    padding: '20px'
+                }}>
+                    <div className="glass-panel" style={{ width: '100%', maxWidth: '1000px', maxHeight: '90vh', overflowY: 'auto', position: 'relative' }}>
+                        <button
+                            onClick={() => setShowLedgerModal(false)}
+                            style={{ position: 'absolute', top: '24px', right: '24px', background: 'none', border: 'none', color: 'var(--text-color)', cursor: 'pointer', opacity: 0.7 }}
+                        >
+                            <X size={20} />
+                        </button>
+
+                        <h2 style={{ fontSize: '1.25rem', marginBottom: '8px' }}>{selectedCompany.name}</h2>
+                        <p style={{ opacity: 0.7, marginBottom: '24px' }}>
+                            Purchase and sales ledger entries for this company profile.
+                        </p>
+
+                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '12px', marginBottom: '24px' }}>
+                            <div className="glass-panel" style={{ padding: '16px' }}>
+                                <div style={{ opacity: 0.7, marginBottom: '6px', fontSize: '0.875rem' }}>Purchase Entries</div>
+                                <div style={{ fontSize: '1.5rem', fontWeight: 700 }}>{purchaseLedger.length}</div>
+                            </div>
+                            <div className="glass-panel" style={{ padding: '16px' }}>
+                                <div style={{ opacity: 0.7, marginBottom: '6px', fontSize: '0.875rem' }}>Sales Entries</div>
+                                <div style={{ fontSize: '1.5rem', fontWeight: 700 }}>{salesLedger.length}</div>
+                            </div>
+                        </div>
+
+                        {[
+                            { title: "Purchase Ledger", items: purchaseLedger },
+                            { title: "Sales Ledger", items: salesLedger }
+                        ].map((section) => (
+                            <div key={section.title} style={{ marginBottom: '24px' }}>
+                                <h3 style={{ fontSize: '1rem', marginBottom: '12px' }}>{section.title}</h3>
+                                <div style={{ overflowX: 'auto' }}>
+                                    <table style={{ width: '100%', minWidth: '700px', borderCollapse: 'collapse', textAlign: 'left' }}>
+                                        <thead style={{ background: 'var(--border-color)' }}>
+                                            <tr>
+                                                <th style={{ padding: '12px 16px' }}>Date</th>
+                                                <th style={{ padding: '12px 16px' }}>Debit</th>
+                                                <th style={{ padding: '12px 16px' }}>Credit</th>
+                                                <th style={{ padding: '12px 16px' }}>Amount</th>
+                                                <th style={{ padding: '12px 16px' }}>Bill Image</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {section.items.length === 0 ? (
+                                                <tr>
+                                                    <td colSpan={5} style={{ padding: '20px 16px', opacity: 0.7 }}>
+                                                        No entries logged yet.
+                                                    </td>
+                                                </tr>
+                                            ) : (
+                                                section.items.map((entry) => (
+                                                    <tr key={entry.id} style={{ borderBottom: '1px solid var(--border-color)' }}>
+                                                        <td style={{ padding: '12px 16px' }}>{entry.date || "-"}</td>
+                                                        <td style={{ padding: '12px 16px' }}>{Number(entry.debit || 0).toFixed(2)}</td>
+                                                        <td style={{ padding: '12px 16px' }}>{Number(entry.credit || 0).toFixed(2)}</td>
+                                                        <td style={{ padding: '12px 16px' }}>{Number(entry.amount || 0).toFixed(2)}</td>
+                                                        <td style={{ padding: '12px 16px' }}>
+                                                            {entry.billImagePublicId || entry.billImageUrl ? (
+                                                                <a
+                                                                    href={entry.billImagePublicId
+                                                                        ? `/api/bills/image?publicId=${encodeURIComponent(entry.billImagePublicId)}`
+                                                                        : entry.billImageUrl}
+                                                                    target="_blank"
+                                                                    rel="noreferrer"
+                                                                    style={{ color: 'var(--accent-color, #38bdf8)' }}
+                                                                >
+                                                                    View Bill
+                                                                </a>
+                                                            ) : (
+                                                                "-"
+                                                            )}
+                                                        </td>
+                                                    </tr>
+                                                ))
+                                            )}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        ))}
                     </div>
                 </div>
             )}

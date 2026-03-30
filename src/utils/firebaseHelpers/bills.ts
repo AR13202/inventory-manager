@@ -23,6 +23,11 @@ export interface BillProductInfo {
 export interface BillItem {
     id?: string;
     vendorName: string; // Company Name
+    vendorGst?: string;
+    vendorAddress?: string;
+    vendorPhone?: string;
+    companyId?: string;
+    ledgerEntryId?: string;
     products: BillProductInfo[];
     taxAmount: string | number;
     taxDetails?: { taxType: string; taxPercentage: number | string; taxAmount: number | string }[];
@@ -30,9 +35,10 @@ export interface BillItem {
     roundOff?: number | string;
     grossAmount: string | number;
     amount: string | number; // Total price with tax
-    billType: "Purchase" | "Sell";
+    billType: "Purchase" | "Sale" | "Sell";
     isScanned?: boolean;
     photoUrl?: string; // Stored URL if scanned
+    photoPublicId?: string;
     date: string;
     createdAt?: string;
     createdBy?: string;

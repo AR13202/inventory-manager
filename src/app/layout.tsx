@@ -1,8 +1,7 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
-import { AuthProvider } from "@/context/AuthContext";
-import { OrgProvider } from "@/context/OrgContext";
+import AppChrome from "@/components/AppChrome";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -30,27 +29,7 @@ export default function RootLayout({
         className={`${geistSans.variable} ${geistMono.variable}`}
         suppressHydrationWarning
       >
-        <AuthProvider>
-          <OrgProvider>
-            <nav className="nav-bar">
-              <div className="nav-logo">
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <rect x="3" y="3" width="7" height="7"></rect>
-                  <rect x="14" y="3" width="7" height="7"></rect>
-                  <rect x="14" y="14" width="7" height="7"></rect>
-                  <rect x="3" y="14" width="7" height="7"></rect>
-                </svg>
-                InvPro
-              </div>
-              <div className="nav-links">
-                <a href="/" className="nav-link">Dashboard</a>
-                <a href="/inventory" className="nav-link">Inventory</a>
-                <a href="/settings" className="nav-link">Settings</a>
-              </div>
-            </nav>
-            {children}
-          </OrgProvider>
-        </AuthProvider>
+        <AppChrome>{children}</AppChrome>
       </body>
     </html>
   );

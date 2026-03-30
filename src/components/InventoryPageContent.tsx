@@ -172,9 +172,6 @@ export default function InventoryPageContent() {
         setActionLoading(false);
     };
 
-    const totalValue = items.reduce((acc, item) => acc + (Number(item.price || 0) * Number(item.quantity || 0)), 0);
-    const lowStockCount = items.filter((item) => Number(item.quantity) <= 10).length;
-
     const filteredItems = [...items]
         .filter((item) => {
             const q = searchQuery.toLowerCase();
@@ -209,12 +206,6 @@ export default function InventoryPageContent() {
                     </button>
                 </div>
             </header>
-
-            <div className="grid-dashboard" style={{ marginTop: "8px", marginBottom: "24px" }}>
-                <div className="glass-panel stat-card"><span className="stat-title">Total Products</span><span className="stat-value">{items.length}</span></div>
-                <div className="glass-panel stat-card"><span className="stat-title">Low / Out of Stock</span><span className="stat-value">{lowStockCount}</span></div>
-                <div className="glass-panel stat-card"><span className="stat-title">Inventory Value</span><span className="stat-value" style={{ fontSize: "2rem" }}>{formatCurrencyINR(totalValue)}</span></div>
-            </div>
 
             <div className="flex-between" style={{ gap: "12px", marginBottom: "16px", flexWrap: "wrap" }}>
                 <input

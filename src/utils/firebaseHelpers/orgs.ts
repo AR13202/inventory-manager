@@ -1,30 +1,47 @@
 // src/utils/firebaseHelpers/orgs.ts
 import {
+    arrayRemove,
+    arrayUnion,
     collection,
     doc,
-    setDoc,
     getDoc,
-    query,
-    where,
     getDocs,
-    updateDoc,
-    arrayUnion,
-    arrayRemove
+    setDoc,
+    updateDoc
 } from "firebase/firestore";
-import { db } from "../firebase";
 import { User } from "firebase/auth";
+import { db } from "../firebase";
 
-// Create Organization
+export interface OrganizationProfile {
+    orgId: string;
+    name: string;
+    password: string;
+    adminUid: string;
+    members: any[];
+    address?: string;
+    gst?: string;
+    bankDetails?: string;
+    logoUrl?: string;
+    logoPublicId?: string;
+    logoResourceType?: "image" | "raw" | "video";
+}
+
 export const createOrganization = async (name: string, password: string, currentUser: User, currentUserName: string) => {
     try {
         const orgRef = doc(collection(db, "organizations"));
         const orgId = orgRef.id;
 
-        const newOrg = {
+        const newOrg: OrganizationProfile = {
             orgId,
             name,
-            password, // Note: In production, consider hashing this!
+            password,
             adminUid: currentUser.uid,
+            address: "",
+            gst: "",
+            bankDetails: "",
+            logoUrl: "",
+            logoPublicId: "",
+            logoResourceType: "image",
             members: [{
                 uid: currentUser.uid,
                 name: currentUserName,
@@ -39,7 +56,6 @@ export const createOrganization = async (name: string, password: string, current
     }
 };
 
-// Join Organization
 export const joinOrganization = async (orgId: string, password: string, currentUser: User, currentUserName: string) => {
     try {
         const orgRef = doc(db, "organizations", orgId);
@@ -50,19 +66,15 @@ export const joinOrganization = async (orgId: string, password: string, currentU
         }
 
         const orgData = orgSnap.data();
-
-        // Check password
         if (orgData.password !== password) {
             return { success: false, error: "Incorrect password." };
         }
 
-        // Check if user is already a member
         const isMember = orgData.members.some((member: any) => member.uid === currentUser.uid);
         if (isMember) {
             return { success: false, error: "You are already a member of this organization." };
         }
 
-        // Add user to members array
         await updateDoc(orgRef, {
             members: arrayUnion({
                 uid: currentUser.uid,
@@ -77,18 +89,14 @@ export const joinOrganization = async (orgId: string, password: string, currentU
     }
 };
 
-// Get User's Organizations
 export const getOrganizationsForUser = async (uid: string) => {
     try {
-        // We fetch all orgs and filter where user is in members array
-        // Since Firestore doesn't natively query deeply nested arrays of objects well 
-        // without structural changes, and this is typically a small dataset per user:
         const orgsRef = collection(db, "organizations");
         const snapshot = await getDocs(orgsRef);
-
         const userOrgs: any[] = [];
-        snapshot.forEach(doc => {
-            const data = doc.data();
+
+        snapshot.forEach((orgDoc) => {
+            const data = orgDoc.data();
             if (data.members && data.members.some((m: any) => m.uid === uid)) {
                 userOrgs.push(data);
             }
@@ -100,7 +108,19 @@ export const getOrganizationsForUser = async (uid: string) => {
     }
 };
 
-// Remove User from Organization
+export const updateOrganizationProfile = async (
+    orgId: string,
+    updates: Partial<Pick<OrganizationProfile, "name" | "address" | "gst" | "bankDetails" | "logoUrl" | "logoPublicId" | "logoResourceType">>
+) => {
+    try {
+        const orgRef = doc(db, "organizations", orgId);
+        await updateDoc(orgRef, updates);
+        return { success: true, error: null };
+    } catch (error: any) {
+        return { success: false, error: error.message };
+    }
+};
+
 export const removeUserFromOrg = async (orgId: string, targetUid: string, currentUserUid: string) => {
     try {
         const orgRef = doc(db, "organizations", orgId);
@@ -109,7 +129,6 @@ export const removeUserFromOrg = async (orgId: string, targetUid: string, curren
         if (!orgSnap.exists()) return { success: false, error: "Org not found" };
 
         const orgData = orgSnap.data();
-
         if (orgData.adminUid !== currentUserUid) {
             return { success: false, error: "Only the admin can remove users." };
         }

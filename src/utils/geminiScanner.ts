@@ -35,6 +35,11 @@ export interface ScannedReceiptData {
     }[];
 }
 
+export interface ScanProviderError {
+    provider: string;
+    message: string;
+}
+
 export async function scanReceipt(base64Image: string) {
     const response = await fetch("/api/bills/scan", {
         method: "POST",
@@ -46,7 +51,15 @@ export async function scanReceipt(base64Image: string) {
 
     const data = await response.json();
     if (!response.ok || !data.success) {
-        throw new Error(data.error || "Failed to scan receipt.");
+        const providerErrors = Array.isArray(data.errors)
+            ? (data.errors as ScanProviderError[])
+                .map((entry) => `${String(entry.provider || "provider")}: ${String(entry.message || "Unknown error")}`)
+                .join(" | ")
+            : "";
+        const errorMessage = providerErrors
+            ? `${data.error || "Failed to scan receipt."} ${providerErrors}`
+            : (data.error || "Failed to scan receipt.");
+        throw new Error(errorMessage);
     }
 
     return data.data as ScannedReceiptData;

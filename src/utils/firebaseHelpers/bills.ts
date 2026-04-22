@@ -13,7 +13,7 @@ import { db } from "../firebase";
 
 export interface BillProductInfo {
     name: string;
-    quantity: number;
+    quantity: number | string;
     unit?: string;
     price: number | string;
     hsn?: string;
@@ -35,6 +35,7 @@ export interface BillItem {
     vendorPhone?: string;
     companyId?: string;
     ledgerEntryId?: string;
+    paymentLedgerEntryId?: string;
     products: BillProductInfo[];
     taxAmount: string | number;
     taxDetails?: BillTaxDetail[];
@@ -43,6 +44,10 @@ export interface BillItem {
     grossAmount: string | number;
     amount: string | number;
     billType: "Purchase" | "Sale";
+    paymentStatus?: "Paid" | "Unpaid";
+    paidDate?: string;
+    paidType?: "NEFT/IMPS/UPI" | "Cash" | "Cheque";
+    chequeNumber?: string;
     isScanned?: boolean;
     photoUrl?: string;
     photoPublicId?: string;

@@ -24,7 +24,8 @@ export interface Company {
 }
 
 export type LedgerType = "purchaseLedger" | "salesLedger";
-export type LedgerEntryKind = "bill" | "credit";
+export type LedgerEntryKind = "bill" | "credit" | "openingBalance" | "payment";
+export type LedgerGateway = "upi" | "bank transfer" | "cheque" | "cash";
 
 export interface CompanyLedgerEntry {
     id?: string;
@@ -40,7 +41,7 @@ export interface CompanyLedgerEntry {
     billImagePublicId?: string;
     billImageResourceType?: "image" | "raw" | "video";
     companyName: string;
-    gateway?: "upi" | "bank transfer" | "cheque";
+    gateway?: LedgerGateway;
     bank?: string;
     chequeNumber?: string;
     note?: string;

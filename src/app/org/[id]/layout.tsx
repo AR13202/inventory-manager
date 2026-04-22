@@ -2,6 +2,7 @@
 
 import { useAuth } from "@/context/AuthContext";
 import { useOrg } from "@/context/OrgContext";
+import { useOrgMobileNav } from "@/components/AppChrome";
 import { useRouter } from "next/navigation";
 import React, { useEffect } from "react";
 import Link from "next/link";
@@ -17,12 +18,17 @@ export default function OrgLayout({
     const { user, loading: authLoading } = useAuth();
     const { activeOrg, organizations, loading: orgLoading } = useOrg();
     const router = useRouter();
+    const { mobileSidebarOpen, setMobileSidebarOpen } = useOrgMobileNav();
 
     useEffect(() => {
         if (!authLoading && !user) {
             router.push("/login");
         }
     }, [user, authLoading, router]);
+
+    useEffect(() => {
+        setMobileSidebarOpen(false);
+    }, [activeOrg?.orgId]);
 
     if (authLoading || orgLoading) {
         return (
@@ -56,10 +62,24 @@ export default function OrgLayout({
         );
     }
 
+    const closeMobileSidebar = () => setMobileSidebarOpen(false);
+
     return (
         <div className="org-shell" style={{ display: 'flex', minHeight: 'calc(100vh - 67px)' }}>
+            {mobileSidebarOpen && (
+                <button
+                    type="button"
+                    className="org-sidebar-backdrop"
+                    aria-label="Close navigation menu"
+                    onClick={closeMobileSidebar}
+                />
+            )}
+
             {/* Sidebar specific to the organization */}
-            <aside style={{ width: '250px', borderRight: '1px solid var(--border-color)', background: 'var(--glass-bg)', padding: '24px 16px' }}>
+            <aside
+                className={`org-sidebar ${mobileSidebarOpen ? "open" : ""}`}
+                style={{ width: '250px', borderRight: '1px solid var(--border-color)', background: 'var(--glass-bg)', padding: '24px 16px' }}
+            >
                 <div style={{ marginBottom: '32px', padding: '0 12px' }}>
                     {activeOrg.logoPublicId && (
                         <img
@@ -74,19 +94,19 @@ export default function OrgLayout({
                 </div>
 
                 <nav style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                    <Link href={`/org/${activeOrg.orgId}`} style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '12px', borderRadius: '8px', transition: 'var(--transition)' }} className="table-row-hover">
+                    <Link href={`/org/${activeOrg.orgId}`} style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '12px', borderRadius: '8px', transition: 'var(--transition)' }} className="table-row-hover" onClick={closeMobileSidebar}>
                         <Home size={18} /> Home
                     </Link>
-                    <Link href={`/org/${activeOrg.orgId}/inventory`} style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '12px', borderRadius: '8px', transition: 'var(--transition)' }} className="table-row-hover">
+                    <Link href={`/org/${activeOrg.orgId}/inventory`} style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '12px', borderRadius: '8px', transition: 'var(--transition)' }} className="table-row-hover" onClick={closeMobileSidebar}>
                         <Box size={18} /> Inventory
                     </Link>
-                    <Link href={`/org/${activeOrg.orgId}/companies`} style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '12px', borderRadius: '8px', transition: 'var(--transition)' }} className="table-row-hover">
+                    <Link href={`/org/${activeOrg.orgId}/companies`} style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '12px', borderRadius: '8px', transition: 'var(--transition)' }} className="table-row-hover" onClick={closeMobileSidebar}>
                         <FileText size={18} /> Companies
                     </Link>
-                    <Link href={`/org/${activeOrg.orgId}/bills`} style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '12px', borderRadius: '8px', transition: 'var(--transition)' }} className="table-row-hover">
+                    <Link href={`/org/${activeOrg.orgId}/bills`} style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '12px', borderRadius: '8px', transition: 'var(--transition)' }} className="table-row-hover" onClick={closeMobileSidebar}>
                         <Box size={18} /> Bills
                     </Link>
-                    <Link href={`/org/${activeOrg.orgId}/users`} style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '12px', borderRadius: '8px', transition: 'var(--transition)' }} className="table-row-hover">
+                    <Link href={`/org/${activeOrg.orgId}/users`} style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '12px', borderRadius: '8px', transition: 'var(--transition)' }} className="table-row-hover" onClick={closeMobileSidebar}>
                         <Users size={18} /> Members
                     </Link>
                 </nav>

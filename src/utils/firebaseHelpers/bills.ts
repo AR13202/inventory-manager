@@ -46,7 +46,7 @@ export interface BillItem {
     billType: "Purchase" | "Sale";
     paymentStatus?: "Paid" | "Unpaid";
     paidDate?: string;
-    paidType?: "NEFT/IMPS/UPI" | "Cash" | "Cheque";
+    paidType?: "NEFT/IMPS" | "UPI" | "Cash" | "Cheque" | "";
     chequeNumber?: string;
     isScanned?: boolean;
     photoUrl?: string;

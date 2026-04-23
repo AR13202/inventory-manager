@@ -49,6 +49,7 @@ const isValidNumericInput = (value: string, allowNegative = false) => {
 const toLedgerGateway = (paidType: BillItem["paidType"]) => {
     if (paidType === "Cheque") return "cheque" as const;
     if (paidType === "Cash") return "cash" as const;
+    if (paidType === "UPI") return "upi" as const;
     return "bank transfer" as const;
 };
 
@@ -69,7 +70,7 @@ const emptyForm = (): FormState => ({
     amount: 0,
     paymentStatus: "Unpaid",
     paidDate: "",
-    paidType: "NEFT/IMPS/UPI",
+    paidType: "NEFT/IMPS",
     chequeNumber: "",
     isScanned: false,
     photoUrl: "",
@@ -222,7 +223,7 @@ export default function BillsPage() {
             roundOff: toFormNumber(bill.roundOff),
             paymentStatus: bill.paymentStatus || "Unpaid",
             paidDate: bill.paidDate || "",
-            paidType: bill.paidType || "NEFT/IMPS/UPI",
+            paidType: bill.paidType || "NEFT/IMPS",
             chequeNumber: bill.chequeNumber || ""
         });
         setPreviewSrc(getBillAssetUrl(bill));
@@ -470,7 +471,7 @@ export default function BillsPage() {
                 amount: Number(form.amount || recalc({ ...form, products }).amount),
                 paymentStatus,
                 paidDate: paymentStatus === "Paid" ? String(form.paidDate || "") : "",
-                paidType: paymentStatus === "Paid" ? (form.paidType || "NEFT/IMPS/UPI") : undefined,
+                paidType: paymentStatus === "Paid" ? (form.paidType || "NEFT/IMPS") : "",
                 chequeNumber: paymentStatus === "Paid" && form.paidType === "Cheque" ? String(form.chequeNumber || "") : "",
                 photoUrl: uploaded.photoUrl || "",
                 photoPublicId: uploaded.photoPublicId || "",
@@ -791,7 +792,7 @@ export default function BillsPage() {
                                                 ...current,
                                                 paymentStatus: e.target.value as "Paid" | "Unpaid",
                                                 paidDate: e.target.value === "Paid" ? current.paidDate || current.date || "" : "",
-                                                paidType: e.target.value === "Paid" ? current.paidType || "NEFT/IMPS/UPI" : undefined,
+                                                paidType: e.target.value === "Paid" ? current.paidType || "NEFT/IMPS" : "",
                                                 chequeNumber: e.target.value === "Paid" && current.paidType === "Cheque" ? current.chequeNumber || "" : ""
                                             }))}
                                         >
@@ -807,8 +808,9 @@ export default function BillsPage() {
                                             </div>
                                             <div>
                                                 <label className="section-label">Paid Type</label>
-                                                <select className="input-field" value={form.paidType || "NEFT/IMPS/UPI"} onChange={(e) => setForm({ ...form, paidType: e.target.value as BillItem["paidType"], chequeNumber: e.target.value === "Cheque" ? form.chequeNumber || "" : "" })}>
-                                                    <option value="NEFT/IMPS/UPI">NEFT / IMPS / UPI</option>
+                                                <select className="input-field" value={form.paidType || "NEFT/IMPS"} onChange={(e) => setForm({ ...form, paidType: e.target.value as BillItem["paidType"], chequeNumber: e.target.value === "Cheque" ? form.chequeNumber || "" : "" })}>
+                                                    <option value="NEFT/IMPS">NEFT / IMPS</option>
+                                                    <option value="UPI">UPI</option>
                                                     <option value="Cash">Cash</option>
                                                     <option value="Cheque">Cheque</option>
                                                 </select>

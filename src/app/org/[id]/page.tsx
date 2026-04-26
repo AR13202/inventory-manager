@@ -5,17 +5,24 @@ import { useOrg } from "@/context/OrgContext";
 import { useEffect, useMemo, useState } from "react";
 import { subscribeToInventory } from "@/utils/firebaseHelpers/inventory";
 import { subscribeToBills, BillItem } from "@/utils/firebaseHelpers/bills";
+import { Company, CompanyLedgerEntry, subscribeToCompanies, subscribeToCompanyLedger } from "@/utils/firebaseHelpers/companies";
 import { formatCurrencyINR, formatMonthYear } from "@/utils/formatters";
 import Link from "next/link";
 import { ArrowUpRight, ArrowDownRight, FileText, Package, IndianRupee, AlertTriangle, ImagePlus, Building2 } from "lucide-react";
 import { updateOrganizationProfile } from "@/utils/firebaseHelpers/orgs";
+
+type HomeTab = "overview" | "outstanding";
 
 export default function OrgHomePage() {
     const { user } = useAuth();
     const { activeOrg, refreshOrgs } = useOrg();
     const [inventoryItems, setInventoryItems] = useState<any[]>([]);
     const [bills, setBills] = useState<BillItem[]>([]);
+    const [companies, setCompanies] = useState<Company[]>([]);
+    const [purchaseLedgerByCompany, setPurchaseLedgerByCompany] = useState<Record<string, CompanyLedgerEntry[]>>({});
+    const [salesLedgerByCompany, setSalesLedgerByCompany] = useState<Record<string, CompanyLedgerEntry[]>>({});
     const [loading, setLoading] = useState(true);
+    const [activeTab, setActiveTab] = useState<HomeTab>("overview");
     const [showProfileForm, setShowProfileForm] = useState(false);
     const [savingProfile, setSavingProfile] = useState(false);
     const [profileError, setProfileError] = useState("");
@@ -37,12 +44,39 @@ export default function OrgHomePage() {
             setLoading(false);
         });
         const unsubscribeBills = subscribeToBills(activeOrg.orgId, setBills);
+        const unsubscribeCompanies = subscribeToCompanies(activeOrg.orgId, setCompanies);
 
         return () => {
             unsubscribeInventory();
             unsubscribeBills();
+            unsubscribeCompanies();
         };
     }, [activeOrg, user]);
+
+    useEffect(() => {
+        if (!activeOrg || !companies.length) {
+            setPurchaseLedgerByCompany({});
+            setSalesLedgerByCompany({});
+            return;
+        }
+
+        const unsubscribers = companies.flatMap((company) => {
+            if (!company.id) return [];
+
+            const unsubPurchase = subscribeToCompanyLedger(activeOrg.orgId, company.id, "purchaseLedger", (items) => {
+                setPurchaseLedgerByCompany((current) => ({ ...current, [company.id as string]: items }));
+            });
+            const unsubSales = subscribeToCompanyLedger(activeOrg.orgId, company.id, "salesLedger", (items) => {
+                setSalesLedgerByCompany((current) => ({ ...current, [company.id as string]: items }));
+            });
+
+            return [unsubPurchase, unsubSales];
+        });
+
+        return () => {
+            unsubscribers.forEach((unsubscribe) => unsubscribe());
+        };
+    }, [activeOrg, companies]);
 
     useEffect(() => {
         if (!activeOrg) return;
@@ -90,7 +124,41 @@ export default function OrgHomePage() {
             ? (currentMonthSales > 0 ? 100 : 0)
             : ((currentMonthSales - previousMonthSales) / previousMonthSales) * 100;
 
-        const recentCompanies = Array.from(new Set(bills.slice(0, 8).map((bill) => bill.vendorName).filter(Boolean)));
+        const recentCompanies = Array.from(new Set(bills.slice(0, 3).map((bill) => bill.vendorName).filter(Boolean)));
+        const ledgerOutstandingByCompany = companies.map((company) => {
+            const purchaseLedger = company.id ? (purchaseLedgerByCompany[company.id] || []) : [];
+            const salesLedger = company.id ? (salesLedgerByCompany[company.id] || []) : [];
+
+            const purchaseOutstanding = Math.max(
+                purchaseLedger.reduce((sum, entry) => sum + Number(entry.credit || 0) - Number(entry.debit || 0), 0),
+                0
+            );
+            const salesOutstanding = Math.max(
+                salesLedger.reduce((sum, entry) => sum + Number(entry.debit || 0) - Number(entry.credit || 0), 0),
+                0
+            );
+
+            return {
+                name: company.name || "Unknown Company",
+                purchaseOutstanding,
+                salesOutstanding
+            };
+        });
+
+        const totalReceivables = ledgerOutstandingByCompany.reduce((sum, company) => sum + company.salesOutstanding, 0);
+        const totalPayables = ledgerOutstandingByCompany.reduce((sum, company) => sum + company.purchaseOutstanding, 0);
+
+        const topReceivableCompanies = ledgerOutstandingByCompany
+            .filter((company) => company.salesOutstanding > 0)
+            .sort((a, b) => b.salesOutstanding - a.salesOutstanding)
+            .slice(0, 5)
+            .map((company) => ({ name: company.name, amount: company.salesOutstanding }));
+
+        const topPayableCompanies = ledgerOutstandingByCompany
+            .filter((company) => company.purchaseOutstanding > 0)
+            .sort((a, b) => b.purchaseOutstanding - a.purchaseOutstanding)
+            .slice(0, 5)
+            .map((company) => ({ name: company.name, amount: company.purchaseOutstanding }));
 
         return {
             totalProducts,
@@ -100,9 +168,13 @@ export default function OrgHomePage() {
             currentMonthSalesOnly,
             currentMonthPurchaseOnly,
             salesDelta,
-            recentCompanies
+            recentCompanies,
+            totalReceivables,
+            totalPayables,
+            topReceivableCompanies,
+            topPayableCompanies
         };
-    }, [inventoryItems, bills]);
+    }, [inventoryItems, bills, companies, purchaseLedgerByCompany, salesLedgerByCompany]);
 
     if (!activeOrg || !user) return <p>Loading dashboard...</p>;
 
@@ -255,6 +327,13 @@ export default function OrgHomePage() {
                 </section>
             )}
 
+            <div className="company-tabs" style={{ marginBottom: "24px" }}>
+                <button className={`company-tab ${activeTab === "overview" ? "active" : ""}`} onClick={() => setActiveTab("overview")}>Overview</button>
+                <button className={`company-tab ${activeTab === "outstanding" ? "active" : ""}`} onClick={() => setActiveTab("outstanding")}>Outstanding Payments</button>
+            </div>
+
+            {activeTab === "overview" ? (
+                <>
             <div className="grid-dashboard" style={{ marginTop: "8px", marginBottom: "24px" }}>
                 <div className="glass-panel stat-card">
                     <span className="stat-title">Total Products</span>
@@ -303,8 +382,8 @@ export default function OrgHomePage() {
                 <section className="glass-panel">
                     <div className="section-header-row">
                         <div>
-                            <p className="section-kicker">Sales</p>
-                            <h2 className="section-title">Current Month Sales</h2>
+                            <p className="section-kicker">Profit</p>
+                            <h2 className="section-title">Current Month Profit</h2>
                         </div>
                     </div>
                         <div style={{ marginTop: "16px" }}>
@@ -322,6 +401,78 @@ export default function OrgHomePage() {
                         </div>
                     </section>
                 </div>
-            </div>
+                </>
+            ) : (
+                <div style={{ display: "grid", gap: "24px" }}>
+                    <div className="grid-dashboard" style={{ marginTop: "8px", marginBottom: "0" }}>
+                        <div className="glass-panel stat-card">
+                            <span className="stat-title">Sales Payments Pending</span>
+                            <span className="stat-value" style={{ fontSize: "2rem" }}>{formatCurrencyINR(dashboardData.totalReceivables)}</span>
+                            <div className="stat-foot"><IndianRupee size={16} /> Amount customers still need to pay</div>
+                        </div>
+                        <div className="glass-panel stat-card">
+                            <span className="stat-title">Purchase Payments Pending</span>
+                            <span className="stat-value" style={{ fontSize: "2rem" }}>{formatCurrencyINR(dashboardData.totalPayables)}</span>
+                            <div className="stat-foot"><IndianRupee size={16} /> Amount you still need to pay suppliers</div>
+                        </div>
+                    </div>
+
+                    <div className="org-home-grid">
+                        <section className="glass-panel">
+                            <div className="section-header-row">
+                                <div>
+                                    <p className="section-kicker">Receivables</p>
+                                    <h2 className="section-title">Top 5 Sales Companies</h2>
+                                </div>
+                                <Link href={`/org/${activeOrg.orgId}/bills`} className="inline-link">Open bills</Link>
+                            </div>
+                            {loading ? (
+                                <p>Loading outstanding sales...</p>
+                            ) : dashboardData.topReceivableCompanies.length === 0 ? (
+                                <p style={{ opacity: 0.7 }}>No pending sales payments right now.</p>
+                            ) : (
+                                <div style={{ display: "grid", gap: "10px", marginTop: "12px" }}>
+                                    {dashboardData.topReceivableCompanies.map((company, index) => (
+                                        <div key={`${company.name}-${index}`} className="list-row-card">
+                                            <div>
+                                                <div style={{ fontWeight: 700 }}>{company.name}</div>
+                                                <div style={{ opacity: 0.65, fontSize: "0.875rem" }}>Pending payment against sales bills</div>
+                                            </div>
+                                            <div style={{ fontWeight: 700 }}>{formatCurrencyINR(company.amount)}</div>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+                        </section>
+
+                        <section className="glass-panel">
+                            <div className="section-header-row">
+                                <div>
+                                    <p className="section-kicker">Payables</p>
+                                    <h2 className="section-title">Top 5 Purchase Companies</h2>
+                                </div>
+                            </div>
+                            {loading ? (
+                                <p>Loading outstanding purchases...</p>
+                            ) : dashboardData.topPayableCompanies.length === 0 ? (
+                                <p style={{ opacity: 0.7 }}>No pending purchase payments right now.</p>
+                            ) : (
+                                <div style={{ display: "grid", gap: "10px", marginTop: "12px" }}>
+                                    {dashboardData.topPayableCompanies.map((company, index) => (
+                                        <div key={`${company.name}-${index}`} className="list-row-card">
+                                            <div>
+                                                <div style={{ fontWeight: 700 }}>{company.name}</div>
+                                                <div style={{ opacity: 0.65, fontSize: "0.875rem" }}>Pending payment against purchase bills</div>
+                                            </div>
+                                            <div style={{ fontWeight: 700 }}>{formatCurrencyINR(company.amount)}</div>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+                        </section>
+                    </div>
+                </div>
+            )}
+        </div>
     );
 }

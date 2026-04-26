@@ -4,33 +4,78 @@ import Groq from "groq-sdk";
 
 const geminiApiKey = process.env.GEMINI_API_KEY || process.env.NEXT_PUBLIC_GEMINI_API_KEY;
 const groqApiKey = process.env.GROQ_API_KEY || process.env.NEXT_PUBLIC_GROQ_API_KEY || process.env.GROK_API_KEY || process.env.NEXT_PUBLIC_GROK_API_KEY;
+const openRouterApiKey = process.env.OPENROUTER_API_KEY || process.env.NEXT_PUBLIC_OPENROUTER_API_KEY;
 
 const prompt = `
-Analyze this receipt, invoice, or bill image and return only raw JSON.
-Do not wrap the response in markdown.
+You are an expert OCR and invoice data extraction system. Analyze this invoice/bill image with extreme care and return ONLY raw JSON — no markdown, no explanation, no code fences.
 
-Use this exact schema:
+CRITICAL EXTRACTION RULES — READ CAREFULLY:
+
+## Company Identification
+- "parentCompanyDetails" = the SELLER / ISSUER of the invoice (whose letterhead/logo is at the top, who signed it as "Authorised Signatory")
+- "customerCompanyDetails" = the BUYER / "Billed To" party
+- Always extract GST numbers for BOTH parties if visible anywhere on the document
+
+## Bill Number
+- Look for: Invoice No., Bill No., Voucher No., Sr. No. at the top of the document
+- This is almost always present — look carefully before leaving it empty
+
+## Date
+- Look for: Date, Dated, Invoice Date fields
+- Format as YYYY-MM-DD
+
+## billType Logic
+- If the parentCompanyDetails company is the one ISSUING/SELLING → "Sale"
+- If the document was received FROM a supplier (i.e., you are the buyer in customerCompanyDetails) → "Purchase"
+- Determine this from context: if "Alliance Engineering" is in "Billed To / Shipped To", it's a Purchase invoice FOR Alliance Engineering
+
+## Items Extraction — MOST CRITICAL SECTION
+- Read EVERY row in the items table meticulously
+- Match each item's: description, HSN/SAC code, quantity, unit, and unit price (Rate column)
+- "price" = unit rate per item, NOT the line total
+- Do NOT confuse line total (Amount) with unit price (Rate/Price)
+- If an item has a sub-description or note on the next line (e.g., "ID 10mm"), append it to the item name
+- Do NOT skip any line items — count all rows carefully before finalizing
+
+## Tax Details
+- Extract EACH tax component separately: CGST, SGST, IGST, UTGST, VAT etc.
+- Some invoices use UTGST instead of SGST for union territories (e.g., Chandigarh)
+- taxPercentage for each component = that component's individual rate (e.g., 9% each for CGST+SGST, not 18% total)
+- taxAmount = the actual rupee amount for each component
+- Top-level taxAmount = SUM of all tax components
+- Top-level taxPercentage = TOTAL effective tax rate
+
+## Amounts
+- freightAndForwardingCharges: Look for "Freight", "F&F", "Forwarding", "Packing" line items
+- roundOff: Look for "Round Off" or "Rounded Off" lines (can be negative)
+- totalAmount = Grand Total / Total Amount After Tax (the final payable amount)
+
+## Validation Check (do this before returning):
+- Sum of (quantity × price) for all items + tax + freight + roundOff should approximately equal totalAmount
+- If your numbers don't add up, re-read the invoice more carefully
+
+Return this exact schema:
 {
   "parentCompanyDetails": {
-    "name": "seller or invoice issuer company name",
-    "gst": "GST number if visible, else empty string",
-    "address": "seller or issuer address if visible, else empty string",
-    "phoneNumbers": "seller or issuer phone if visible, else empty string"
+    "name": "",
+    "gst": "",
+    "address": "",
+    "phoneNumbers": ""
   },
   "customerCompanyDetails": {
-    "name": "billed to / buyer / customer company name",
-    "gst": "GST number if visible, else empty string",
-    "address": "customer address if visible, else empty string",
-    "phoneNumbers": "customer phone if visible, else empty string"
+    "name": "",
+    "gst": "",
+    "address": "",
+    "phoneNumbers": ""
   },
-  "date": "YYYY-MM-DD if visible, else empty string",
-  "billNumber": "invoice or bill number if visible, else empty string",
+  "date": "",
+  "billNumber": "",
   "billType": "Purchase or Sale or Unknown",
   "taxAmount": 0,
   "taxPercentage": 0,
   "taxDetails": [
     {
-      "taxType": "CGST/SGST/IGST/VAT/etc",
+      "taxType": "",
       "taxPercentage": 0,
       "taxAmount": 0
     }
@@ -40,26 +85,18 @@ Use this exact schema:
   "totalAmount": 0,
   "items": [
     {
-      "name": "item name",
-      "hsn": "hsn or empty string",
-      "quantity": 1,
-      "unit": "pcs/kg/box/etc or empty string",
+      "name": "",
+      "hsn": "",
+      "quantity": 0,
+      "unit": "",
       "price": 0,
       "category": "Trade"
     }
   ]
 }
-
-Rules:
-- Prefer details from the billed to section for customerCompanyDetails.
-- Extract invoice number / bill number / voucher number into billNumber.
-- Extract the quantity unit whenever visible.
-- Use numeric values for quantity, price, taxAmount, taxPercentage, freightAndForwardingCharges, roundOff, and totalAmount.
-- billType should be "Sale" when the document clearly looks like a sales invoice issued to a customer, "Purchase" when it clearly looks like a supplier bill or purchase invoice received by the uploader, otherwise "Unknown".
-- If a field is not visible, keep it empty or 0.
 `;
 
-type ScanProvider = "gemini" | "groq";
+type ScanProvider = "gemini" | "groq" | "openrouter";
 
 type CompanyDetails = {
     name: string;
@@ -204,7 +241,7 @@ async function scanWithGemini(image: string) {
     const { base64Data, mimeType } = parseBase64Image(image);
     const genAI = new GoogleGenerativeAI(geminiApiKey);
     const model = genAI.getGenerativeModel({
-        model: "gemini-2.5-flash",
+        model: "gemma3-12b",
         generationConfig: {
             responseMimeType: "application/json"
         }
@@ -273,10 +310,122 @@ async function scanWithGroq(image: string) {
     }
 }
 
+// Best to OK order: accuracy + speed + stability on free tier
+const OPENROUTER_VISION_MODELS = [
+    "google/gemma-4-31b-it:free",
+    "google/gemma-4-26b-a4b-it:free",
+    "google/gemma-3-27b-it:free",                     // Good - stable, confirmed working
+    "qwen/qwen2.5-vl-72b-instruct:free",              // Best - largest, great at tables/line items
+    "qwen/qwen2.5-vl-32b-instruct:free",              // Great - slightly smaller but very fast
+    "meta-llama/llama-3.2-11b-vision-instruct:free",  // OK - lightweight fallback
+    "google/gemma-3-12b-it:free",                     // Last resort - smaller, less accurate
+];
+
+async function scanWithOpenRouter(image: string) {
+    if (!openRouterApiKey) {
+        throw new Error("OpenRouter API key is not configured.");
+    }
+
+    const { dataUrl, mimeType } = parseBase64Image(image);
+    if (!mimeType.startsWith("image/")) {
+        throw new Error(`OpenRouter vision fallback does not support ${mimeType} files.`);
+    }
+
+    let lastError: Error = new Error("No models available.");
+
+    for (const model of OPENROUTER_VISION_MODELS) {
+        try {
+            console.log(`Scanning with OpenRouter model: ${model}`);
+
+            const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+                method: "POST",
+                headers: {
+                    Authorization: `Bearer ${openRouterApiKey}`,
+                    "Content-Type": "application/json",
+                    "X-Title": "Invoice Scanner"
+                },
+                body: JSON.stringify({
+                    model,
+                    temperature: 0,
+                    messages: [
+                        {
+                            role: "user",
+                            content: [
+                                { type: "text", text: prompt },
+                                { type: "image_url", image_url: { url: dataUrl } }
+                            ]
+                        }
+                    ]
+                })
+            });
+
+            const payload = await response.json();
+
+            // These status codes mean model/provider is down — try next
+            if (response.status === 500 || response.status === 529 || response.status === 503) {
+                const reason = payload?.error?.message || `HTTP ${response.status}`;
+                console.warn(`Model ${model} unavailable: ${reason}, trying next...`);
+                lastError = new Error(reason);
+                continue;
+            }
+
+            // Rate limited — try next model
+            if (response.status === 429) {
+                console.warn(`Model ${model} rate limited, trying next...`);
+                lastError = new Error(`${model} rate limited`);
+                continue;
+            }
+
+            // Other non-OK responses — throw immediately (auth error, bad request etc)
+            if (!response.ok) {
+                const apiMessage =
+                    payload?.error?.message ||
+                    payload?.message ||
+                    `OpenRouter request failed with status ${response.status}`;
+                throw new Error(apiMessage);
+            }
+
+            const content = payload?.choices?.[0]?.message?.content;
+            const text = Array.isArray(content)
+                ? content.map((entry: { text?: string }) => entry?.text || "").join("")
+                : String(content || "");
+
+            // Empty response — try next model
+            if (!text.trim()) {
+                console.warn(`Model ${model} returned empty response, trying next...`);
+                lastError = new Error(`${model} returned empty response`);
+                continue;
+            }
+
+            // Invalid JSON — try next model
+            try {
+                const result = JSON.parse(extractJsonText(text));
+                console.log(`Successfully scanned with model: ${model}`);
+                return result;
+            } catch {
+                console.warn(`Model ${model} returned invalid JSON, trying next...`);
+                lastError = new Error(`${model} returned invalid JSON`);
+                continue;
+            }
+
+        } catch (err) {
+            // Only rethrow if it's not a retriable error
+            if (err instanceof Error && !err.message.includes("rate limit") && !err.message.includes("unavailable")) {
+                throw err;
+            }
+            lastError = err instanceof Error ? err : new Error(String(err));
+            console.warn(`Model ${model} failed: ${lastError.message}, trying next...`);
+        }
+    }
+
+    throw new Error(`All OpenRouter models failed. Last error: ${lastError.message}`);
+}
+
 async function scanWithFallback(image: string) {
     const providers: Array<{ name: ScanProvider; scan: (value: string) => Promise<unknown> }> = [
+        { name: "openrouter", scan: scanWithOpenRouter },
+        { name: "gemini", scan: scanWithGemini },
         { name: "groq", scan: scanWithGroq },
-        { name: "gemini", scan: scanWithGemini }
     ];
     const errors: ProviderError[] = [];
 
@@ -292,6 +441,7 @@ async function scanWithFallback(image: string) {
             };
         } catch (error) {
             const message = error instanceof Error ? error.message : "Unknown scanning error.";
+            console.error(`[bill-scan] provider failed: ${provider.name}`, error);
             console.error(`${provider.name} scanning error:`, error);
             errors.push({ provider: provider.name, message });
         }

@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useEffect, useMemo, useState } from "react";
-import { ArrowLeft, Building2, CreditCard, FileText, Pencil, Plus, Search, Trash2, Wallet } from "lucide-react";
+import { ArrowLeft, Building2, CreditCard, FileText, Pencil, Plus, RefreshCw, Search, Trash2, Wallet } from "lucide-react";
 import { useAuth } from "@/context/AuthContext";
 import { useOrg } from "@/context/OrgContext";
 import {
@@ -13,6 +13,7 @@ import {
     deleteCompanyLedgerEntry,
     LedgerGateway,
     LedgerType,
+    recalculateCompanyBalance,
     subscribeToCompanies,
     subscribeToCompanyLedger,
     updateCompanyItem,
@@ -43,16 +44,17 @@ export default function CompaniesPage() {
     const [selectedCompanyId, setSelectedCompanyId] = useState<string | null>(null);
     const [purchaseLedger, setPurchaseLedger] = useState<CompanyLedgerEntry[]>([]);
     const [salesLedger, setSalesLedger] = useState<CompanyLedgerEntry[]>([]);
-    const [activeTab, setActiveTab] = useState<LedgerType>("purchaseLedger");
     const [query, setQuery] = useState("");
     const [loading, setLoading] = useState(true);
     const [showCompanyModal, setShowCompanyModal] = useState(false);
     const [editingCompanyId, setEditingCompanyId] = useState<string | null>(null);
+    const [refreshing, setRefreshing] = useState(false);
+    const [sortOption, setSortOption] = useState<"name-asc" | "name-desc" | "balance-asc" | "balance-desc">("name-asc");
     const [companyForm, setCompanyForm] = useState(emptyCompany);
     const [showLedgerModal, setShowLedgerModal] = useState(false);
     const [ledgerModalMode, setLedgerModalMode] = useState<"credit" | "openingBalance" | "edit">("credit");
     const [editingLedgerEntry, setEditingLedgerEntry] = useState<CompanyLedgerEntry | null>(null);
-    const [ledgerForm, setLedgerForm] = useState(emptyLedgerForm);
+    const [ledgerForm, setLedgerForm] = useState({ ...emptyLedgerForm, ledgerTarget: "purchase" as "purchase" | "sales" });
     const [error, setError] = useState("");
 
     useEffect(() => {
@@ -75,15 +77,41 @@ export default function CompaniesPage() {
     }, [activeOrg, selectedCompanyId]);
 
     const selectedCompany = useMemo(() => companies.find((company) => company.id === selectedCompanyId) || null, [companies, selectedCompanyId]);
-    const ledgerRows = activeTab === "purchaseLedger" ? purchaseLedger : salesLedger;
+    const ledgerRows = useMemo(() => {
+        const purchase = purchaseLedger.map(e => ({ ...e, source: "Purchase" as const }));
+        const sales = salesLedger.map(e => ({ ...e, source: "Sale" as const }));
+        return [...purchase, ...sales].sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+    }, [purchaseLedger, salesLedger]);
+
     const totalDebit = [...purchaseLedger, ...salesLedger].reduce((sum, entry) => sum + Number(entry.debit || 0), 0);
     const totalCredit = [...purchaseLedger, ...salesLedger].reduce((sum, entry) => sum + Number(entry.credit || 0), 0);
-    const remainingBalance = totalCredit - totalDebit;
-    const filteredCompanies = useMemo(() => companies.filter((company) => {
-        const q = query.toLowerCase();
-        if (!q) return true;
-        return company.name.toLowerCase().includes(q) || (company.gst || "").toLowerCase().includes(q);
-    }), [companies, query]);
+    const remainingBalance = totalDebit - totalCredit;
+    const filteredCompanies = useMemo(() => {
+        let result = companies.filter((company) => {
+            const q = query.toLowerCase();
+            if (!q) return true;
+            return company.name.toLowerCase().includes(q) || (company.gst || "").toLowerCase().includes(q);
+        });
+
+        result.sort((a, b) => {
+            if (sortOption === "name-asc") return a.name.localeCompare(b.name);
+            if (sortOption === "name-desc") return b.name.localeCompare(a.name);
+            if (sortOption === "balance-asc") return (a.balance || 0) - (b.balance || 0);
+            if (sortOption === "balance-desc") return (b.balance || 0) - (a.balance || 0);
+            return 0;
+        });
+
+        return result;
+    }, [companies, query, sortOption]);
+
+    useEffect(() => {
+        if (!activeOrg || loading || companies.length === 0 || refreshing) return;
+        const needsRefresh = companies.filter(c => c.balance === undefined);
+        if (needsRefresh.length > 0) {
+            const batch = needsRefresh.slice(0, 5);
+            batch.forEach(c => recalculateCompanyBalance(activeOrg.orgId, c.id!));
+        }
+    }, [companies, activeOrg, loading, refreshing]);
 
     const openCompanyModal = (company?: Company) => {
         setEditingCompanyId(company?.id || null);
@@ -98,7 +126,7 @@ export default function CompaniesPage() {
         setCompanyForm(emptyCompany);
     };
 
-    const openLedgerModal = (mode: "credit" | "openingBalance" | "edit", entry?: CompanyLedgerEntry) => {
+    const openLedgerModal = (mode: "credit" | "openingBalance" | "edit", entry?: CompanyLedgerEntry & { source?: "Purchase" | "Sale" }) => {
         setLedgerModalMode(mode);
         setEditingLedgerEntry(entry || null);
         setLedgerForm(entry ? {
@@ -107,8 +135,9 @@ export default function CompaniesPage() {
             date: entry.date || new Date().toISOString().split("T")[0],
             bank: entry.bank || "",
             chequeNumber: entry.chequeNumber || "",
-            note: entry.note || ""
-        } : emptyLedgerForm);
+            note: entry.note || "",
+            ledgerTarget: entry.source === "Purchase" ? "purchase" : "sales"
+        } : { ...emptyLedgerForm, date: new Date().toISOString().split("T")[0], ledgerTarget: "sales" });
         setShowLedgerModal(true);
         setError("");
     };
@@ -116,7 +145,7 @@ export default function CompaniesPage() {
     const closeLedgerModal = () => {
         setShowLedgerModal(false);
         setEditingLedgerEntry(null);
-        setLedgerForm(emptyLedgerForm);
+        setLedgerForm({ ...emptyLedgerForm, ledgerTarget: "purchase" });
     };
 
     const saveCompany = async (event: React.FormEvent) => {
@@ -143,23 +172,20 @@ export default function CompaniesPage() {
             return;
         }
 
-        const commonPayload = {
+        const targetLedger = ledgerForm.ledgerTarget === "sales" ? "salesLedger" : "purchaseLedger";
+        const payload: any = {
             date: ledgerForm.date,
             amount,
             companyName: selectedCompany.name,
             gateway: ledgerForm.gateway,
             bank: ledgerForm.bank,
             chequeNumber: ledgerForm.gateway === "cheque" ? ledgerForm.chequeNumber : "",
-            note: ledgerForm.note
-        };
-
-        const payload: Omit<CompanyLedgerEntry, "id" | "createdAt" | "updatedAt"> = {
+            note: ledgerForm.note,
             entryKind: ledgerModalMode === "openingBalance" ? "openingBalance" : "credit",
             billNumber: ledgerModalMode === "openingBalance" ? `Opening Balance FY ${getFinancialYearLabel()}` : "",
-            billType: activeTab === "salesLedger" ? "Sale" : "Purchase",
-            credit: activeTab === "salesLedger" ? amount : 0,
-            debit: activeTab === "purchaseLedger" ? amount : 0,
-            ...commonPayload
+            billType: ledgerForm.ledgerTarget === "sales" ? "Sale" : "Purchase",
+            credit: ledgerForm.ledgerTarget === "sales" ? amount : 0,
+            debit: ledgerForm.ledgerTarget === "purchase" ? amount : 0
         };
 
         if (ledgerModalMode === "edit" && editingLedgerEntry?.id) {
@@ -167,7 +193,7 @@ export default function CompaniesPage() {
                 setError("Bill-linked ledger rows should be edited from the Bills tab.");
                 return;
             }
-            const result = await updateCompanyLedgerEntry(activeOrg.orgId, selectedCompany.id, activeTab, editingLedgerEntry.id, payload);
+            const result = await updateCompanyLedgerEntry(activeOrg.orgId, selectedCompany.id, targetLedger, editingLedgerEntry.id, payload);
             if (result.error) {
                 setError(result.error);
                 return;
@@ -176,7 +202,7 @@ export default function CompaniesPage() {
             return;
         }
 
-        const result = await addCompanyLedgerEntry(activeOrg.orgId, selectedCompany.id, activeTab, payload);
+        const result = await addCompanyLedgerEntry(activeOrg.orgId, selectedCompany.id, targetLedger, payload);
         if (result.error) {
             setError(result.error);
             return;
@@ -184,13 +210,14 @@ export default function CompaniesPage() {
         closeLedgerModal();
     };
 
-    const removeLedgerEntry = async (entry: CompanyLedgerEntry) => {
+    const removeLedgerEntry = async (entry: CompanyLedgerEntry & { source?: "Purchase" | "Sale" }) => {
         if (!activeOrg || !selectedCompany?.id || !entry.id) return;
         if (entry.entryKind === "bill" || entry.entryKind === "payment") {
             setError("Bill-linked ledger rows should be deleted from the Bills tab.");
             return;
         }
-        const result = await deleteCompanyLedgerEntry(activeOrg.orgId, selectedCompany.id, activeTab, entry.id);
+        const targetLedger = entry.source === "Purchase" ? "purchaseLedger" : "salesLedger";
+        const result = await deleteCompanyLedgerEntry(activeOrg.orgId, selectedCompany.id, targetLedger, entry.id);
         if (result.error) {
             setError(result.error);
         }
@@ -205,6 +232,18 @@ export default function CompaniesPage() {
         }
         closeCompanyModal();
         setSelectedCompanyId(null);
+    };
+
+    const handleRefreshAllBalances = async () => {
+        if (!activeOrg || refreshing) return;
+        setRefreshing(true);
+        try {
+            await Promise.all(companies.map(c => recalculateCompanyBalance(activeOrg.orgId, c.id!)));
+        } catch (error) {
+            console.error("Refresh balances error:", error);
+        } finally {
+            setRefreshing(false);
+        }
     };
 
     return (
@@ -222,17 +261,52 @@ export default function CompaniesPage() {
 
             {!selectedCompany ? (
                 <section className="glass-panel" style={{ padding: 0, overflow: "hidden" }}>
-                    <div style={{ padding: "18px", borderBottom: "1px solid var(--border-color)" }}>
-                        <div className="search-box">
+                    <div style={{ padding: "18px", borderBottom: "1px solid var(--border-color)", display: "flex", flexWrap: "wrap", gap: "12px" }}>
+                        <div className="search-box" style={{ flex: 2, minWidth: "200px" }}>
                             <Search size={16} />
                             <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search company name or GST..." />
+                        </div>
+                        <div style={{ display: "flex", gap: "8px", flex: 1, minWidth: "200px" }}>
+                            <select 
+                                value={sortOption} 
+                                onChange={(e) => setSortOption(e.target.value as any)}
+                                className="panel-icon-btn"
+                                style={{ flex: 1, padding: "0 10px", fontSize: "13px", height: "38px", border: "1px solid var(--border-color)", borderRadius: "8px", background: "var(--card-bg)" }}
+                            >
+                                <option value="name-asc">Name (A-Z)</option>
+                                <option value="name-desc">Name (Z-A)</option>
+                                <option value="balance-asc">Balance (Low-High)</option>
+                                <option value="balance-desc">Balance (High-Low)</option>
+                            </select>
+                            <button
+                                onClick={handleRefreshAllBalances}
+                                disabled={refreshing}
+                                className="panel-icon-btn"
+                                title="Refresh Balances"
+                                style={{ opacity: refreshing ? 0.5 : 1, width: "38px", height: "38px" }}
+                            >
+                                <RefreshCw size={16} className={refreshing ? "animate-spin" : ""} />
+                            </button>
                         </div>
                     </div>
                     <div style={{ maxHeight: "72vh", overflowY: "auto" }}>
                         {loading ? <div style={{ padding: "24px" }}>Loading companies...</div> : filteredCompanies.length === 0 ? <div style={{ padding: "24px", opacity: 0.7 }}>No companies found.</div> : filteredCompanies.map((company) => (
                             <button key={company.id} type="button" className="workspace-list-row" onClick={() => setSelectedCompanyId(company.id || null)}>
-                                <div>
-                                    <div style={{ fontWeight: 700 }}>{company.name}</div>
+                                <div style={{ flex: 1, textAlign: "left" }}>
+                                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px" }}>
+                                        <div style={{ fontWeight: 700 }}>{company.name}</div>
+                                        <div style={{ 
+                                            fontSize: "11px", 
+                                            fontWeight: 800, 
+                                            padding: "2px 6px", 
+                                            borderRadius: "12px",
+                                            backgroundColor: (company.balance || 0) > 0 ? "#dcfce7" : (company.balance || 0) < 0 ? "#fee2e2" : "#f1f5f9",
+                                            color: (company.balance || 0) > 0 ? "#166534" : (company.balance || 0) < 0 ? "#991b1b" : "#475569"
+                                        }}>
+                                            {formatCurrencyINR(Math.abs(company.balance || 0))}
+                                            {(company.balance || 0) > 0 ? " Dr" : (company.balance || 0) < 0 ? " Cr" : ""}
+                                        </div>
+                                    </div>
                                     <div style={{ opacity: 0.76 }}>{company.gst || "No GST recorded"}</div>
                                 </div>
                                 <Building2 size={18} />
@@ -259,44 +333,60 @@ export default function CompaniesPage() {
                             </div>
                         </div>
 
-                        <div className="company-tabs">
-                            <button className={`company-tab ${activeTab === "purchaseLedger" ? "active" : ""}`} onClick={() => setActiveTab("purchaseLedger")}>Purchase</button>
-                            <button className={`company-tab ${activeTab === "salesLedger" ? "active" : ""}`} onClick={() => setActiveTab("salesLedger")}>Sales</button>
-                        </div>
-
                         <div className="detail-pair-grid">
                             <div className="bill-section"><span className="detail-label">GST</span><strong>{selectedCompany.gst || "-"}</strong></div>
                             <div className="bill-section"><span className="detail-label">Phone</span><strong>{selectedCompany.phoneNumbers || "-"}</strong></div>
                             <div className="bill-section"><span className="detail-label">Total Debit</span><strong>{formatCurrencyINR(totalDebit)}</strong></div>
                             <div className="bill-section"><span className="detail-label">Total Credit</span><strong>{formatCurrencyINR(totalCredit)}</strong></div>
-                            <div className="bill-section"><span className="detail-label">Remaining Balance</span><strong>{formatCurrencyINR(remainingBalance)}</strong></div>
+                            <div className="bill-section"><span className="detail-label">Remaining Balance</span>
+                                <strong>
+                                    {formatCurrencyINR(Math.abs(remainingBalance))}
+                                    {remainingBalance > 0 ? " Dr (Receivable)" : remainingBalance < 0 ? " Cr (Payable)" : " (Settled)"}
+                                </strong>
+                            </div>
                         </div>
 
                         <div className="bill-section" style={{ padding: 0, overflow: "hidden" }}>
                             <table style={{ width: "100%", borderCollapse: "collapse" }}>
                                 <thead style={{ background: "var(--border-color)" }}>
                                     <tr>
-                                        {["Date", "Bill Number", "Debit", "Credit", "Amount", "Actions"].map((label) => <th key={label} style={{ padding: "14px 16px", textAlign: "left" }}>{label}</th>)}
+                                        {["Date", "Type", "Bill No", "Mode", "Debit", "Credit", "Amount", "Remarks", "Actions"].map((label) => <th key={label} style={{ padding: "14px 16px", textAlign: "left" }}>{label}</th>)}
                                     </tr>
                                 </thead>
                                 <tbody>
                                     {ledgerRows.length === 0 ? (
-                                        <tr><td colSpan={6} style={{ padding: "24px 16px", opacity: 0.7 }}>No {activeTab === "purchaseLedger" ? "purchase" : "sales"} entries yet.</td></tr>
+                                        <tr><td colSpan={9} style={{ padding: "24px 16px", opacity: 0.7 }}>No entries yet.</td></tr>
                                     ) : ledgerRows.map((entry) => (
                                         <tr key={entry.id} style={{ borderBottom: "1px solid var(--border-color)" }}>
                                             <td style={{ padding: "14px 16px" }}>{entry.date}</td>
+                                            <td style={{ padding: "14px 16px" }}>
+                                                <span style={{ 
+                                                    fontSize: "11px", 
+                                                    fontWeight: 700, 
+                                                    padding: "2px 6px", 
+                                                    borderRadius: "4px",
+                                                    backgroundColor: entry.source === "Purchase" ? "#eff6ff" : "#fff7ed",
+                                                    color: entry.source === "Purchase" ? "#1e40af" : "#9a3412"
+                                                }}>
+                                                    {entry.source}
+                                                </span>
+                                            </td>
                                             <td style={{ padding: "14px 16px" }}>
                                                 {entry.billImagePublicId || entry.billImageUrl ? (
                                                     <a className="inline-link" href={entry.billImagePublicId ? `/api/bills/file?publicId=${encodeURIComponent(entry.billImagePublicId)}&resourceType=${encodeURIComponent(entry.billImageResourceType || "image")}` : entry.billImageUrl} target="_blank" rel="noreferrer">
                                                         {entry.billNumber || "View Bill"}
                                                     </a>
                                                 ) : (
-                                                    entry.billNumber || entry.note || "-"
+                                                    entry.billNumber || "-"
                                                 )}
                                             </td>
+                                            <td style={{ padding: "14px 16px", textTransform: "capitalize" }}>{entry.gateway || "-"}</td>
                                             <td style={{ padding: "14px 16px" }}>{formatCurrencyINR(entry.debit)}</td>
                                             <td style={{ padding: "14px 16px" }}>{formatCurrencyINR(entry.credit)}</td>
                                             <td style={{ padding: "14px 16px", fontWeight: 700 }}>{formatCurrencyINR(entry.amount)}</td>
+                                            <td style={{ padding: "14px 16px", fontSize: "12px", maxWidth: "150px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={entry.note}>
+                                                {entry.note || "-"}
+                                            </td>
                                             <td style={{ padding: "14px 16px" }}>
                                                 <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
                                                     <button type="button" className="panel-icon-btn" onClick={() => openLedgerModal("edit", entry)} disabled={entry.entryKind === "bill" || entry.entryKind === "payment"} title={entry.entryKind === "bill" || entry.entryKind === "payment" ? "Edit from Bills tab" : "Edit entry"}>

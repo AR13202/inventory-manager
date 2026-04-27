@@ -18,6 +18,7 @@ export interface Company {
     gst: string;
     address: string;
     phoneNumbers: string;
+    balance?: number;
     createdAt?: any;
     updatedAt?: any;
     createdBy: string;
@@ -157,6 +158,7 @@ export const addCompanyLedgerEntry = async (
             createdAt: serverTimestamp(),
             updatedAt: serverTimestamp()
         });
+        await recalculateCompanyBalance(orgId, companyId);
         return { success: true, id: docRef.id, error: null };
     } catch (error: any) {
         return { success: false, id: null, error: error.message };
@@ -176,6 +178,7 @@ export const updateCompanyLedgerEntry = async (
             ...updates,
             updatedAt: serverTimestamp()
         });
+        await recalculateCompanyBalance(orgId, companyId);
         return { success: true, error: null };
     } catch (error: any) {
         return { success: false, error: error.message };
@@ -191,6 +194,7 @@ export const deleteCompanyLedgerEntry = async (
     try {
         const ledgerDocRef = doc(db, "organizations", orgId, "companies", companyId, ledgerType, entryId);
         await deleteDoc(ledgerDocRef);
+        await recalculateCompanyBalance(orgId, companyId);
         return { success: true, error: null };
     } catch (error: any) {
         return { success: false, error: error.message };
@@ -216,6 +220,42 @@ export const deleteCompanyItem = async (orgId: string, itemId: string) => {
         await deleteDoc(docRef);
         return { success: true, error: null };
     } catch (error: any) {
+        return { success: false, error: error.message };
+    }
+};
+
+export const recalculateCompanyBalance = async (orgId: string, companyId: string) => {
+    try {
+        const purchaseRef = collection(db, "organizations", orgId, "companies", companyId, "purchaseLedger");
+        const salesRef = collection(db, "organizations", orgId, "companies", companyId, "salesLedger");
+
+        const [purchaseSnap, salesSnap] = await Promise.all([
+            getDocs(purchaseRef),
+            getDocs(salesRef)
+        ]);
+
+        let totalDebit = 0;
+        let totalCredit = 0;
+
+        purchaseSnap.forEach(snapDoc => {
+            const data = snapDoc.data();
+            totalDebit += Number(data.debit || 0);
+            totalCredit += Number(data.credit || 0);
+        });
+
+        salesSnap.forEach(snapDoc => {
+            const data = snapDoc.data();
+            totalDebit += Number(data.debit || 0);
+            totalCredit += Number(data.credit || 0);
+        });
+
+        const balance = totalDebit - totalCredit;
+        const companyRef = doc(db, "organizations", orgId, "companies", companyId);
+        await updateDoc(companyRef, { balance, updatedAt: serverTimestamp() });
+
+        return { success: true, balance };
+    } catch (error: any) {
+        console.error("Balance recalculation error:", error);
         return { success: false, error: error.message };
     }
 };

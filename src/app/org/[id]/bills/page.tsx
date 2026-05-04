@@ -12,6 +12,7 @@ import {
     CompanyLedgerEntry,
     deleteCompanyLedgerEntry,
     ensureCompanyProfile,
+    removeBillFromCompanyReceipts,
     subscribeToCompanies,
     updateCompanyLedgerEntry
 } from "@/utils/firebaseHelpers/companies";
@@ -22,6 +23,7 @@ import { scanReceipt } from "@/utils/geminiScanner";
 
 type FormState = Partial<BillItem> & { vendorGst?: string; vendorAddress?: string; vendorPhone?: string };
 type BillFilter = "All" | "Purchase" | "Sale";
+type BillSort = "dateDesc" | "dateAsc" | "billNumber" | "companyName";
 
 const DECIMAL_INPUT_PATTERN = /^\d*(\.\d*)?$/;
 const SIGNED_DECIMAL_INPUT_PATTERN = /^-?\d*(\.\d*)?$/;
@@ -39,6 +41,17 @@ const parseNumericValue = (value: string | number | undefined) => {
     if (!trimmed || trimmed === "-" || trimmed === "." || trimmed === "-.") return 0;
     const parsed = Number(trimmed);
     return Number.isFinite(parsed) ? parsed : 0;
+};
+
+const getRoundOffSign = (value: string | number | undefined) => {
+    const parsed = parseNumericValue(value);
+    return parsed < 0 ? "negative" : "positive";
+};
+
+const applyRoundOffSign = (value: string | number | undefined, sign: "positive" | "negative") => {
+    const numeric = Math.abs(parseNumericValue(value));
+    if (!numeric) return "";
+    return sign === "negative" ? `-${numeric}` : String(numeric);
 };
 
 const isValidNumericInput = (value: string, allowNegative = false) => {
@@ -116,6 +129,7 @@ export default function BillsPage() {
     const [loading, setLoading] = useState(true);
     const [query, setQuery] = useState("");
     const [billFilter, setBillFilter] = useState<BillFilter>("All");
+    const [billSort, setBillSort] = useState<BillSort>("dateDesc");
     const [editingId, setEditingId] = useState<string | null>(null);
     const [selectedId, setSelectedId] = useState<string | null>(null);
     const [showForm, setShowForm] = useState(searchParams.get("mode") === "new");
@@ -158,14 +172,34 @@ export default function BillsPage() {
         return () => document.removeEventListener("mousedown", onPointerDown);
     }, []);
 
-    const filtered = useMemo(() => bills.filter((bill) => {
-        const q = query.toLowerCase();
-        const matchesFilter = billFilter === "All" ? true : bill.billType === billFilter;
-        const matchesQuery = !q
-            ? true
-            : (bill.vendorName || "").toLowerCase().includes(q) || (bill.billNumber || "").toLowerCase().includes(q);
-        return matchesFilter && matchesQuery;
-    }), [bills, query, billFilter]);
+    const filtered = useMemo(() => {
+        const q = query.trim().toLowerCase();
+
+        return [...bills].filter((bill) => {
+            const matchesFilter = billFilter === "All" ? true : bill.billType === billFilter;
+            const amountString = String(Number(bill.amount || 0));
+            const amountFormatted = formatCurrencyINR(Number(bill.amount || 0)).toLowerCase();
+            const matchesQuery = !q
+                ? true
+                : (bill.vendorName || "").toLowerCase().includes(q)
+                    || (bill.billNumber || "").toLowerCase().includes(q)
+                    || amountString.includes(q)
+                    || amountFormatted.includes(q);
+            return matchesFilter && matchesQuery;
+        }).sort((a, b) => {
+            if (billSort === "dateAsc" || billSort === "dateDesc") {
+                const aTime = a.date ? new Date(a.date).getTime() : 0;
+                const bTime = b.date ? new Date(b.date).getTime() : 0;
+                return billSort === "dateAsc" ? aTime - bTime : bTime - aTime;
+            }
+
+            if (billSort === "billNumber") {
+                return String(a.billNumber || a.id || "").localeCompare(String(b.billNumber || b.id || ""), undefined, { numeric: true, sensitivity: "base" });
+            }
+
+            return String(a.vendorName || "").localeCompare(String(b.vendorName || ""), undefined, { sensitivity: "base" });
+        });
+    }, [bills, query, billFilter, billSort]);
 
     const selected = useMemo(() => bills.find((bill) => bill.id === selectedId) || null, [bills, selectedId]);
     const purchaseCount = useMemo(() => bills.filter((bill) => bill.billType === "Purchase").length, [bills]);
@@ -601,6 +635,11 @@ export default function BillsPage() {
                 if (paymentDeleteResult.error) throw new Error(paymentDeleteResult.error);
             }
 
+            if (bill.companyId && bill.billType === "Sale" && bill.id) {
+                const receiptCleanupResult = await removeBillFromCompanyReceipts(activeOrg.orgId, bill.companyId, bill.id);
+                if (receiptCleanupResult.error) throw new Error(receiptCleanupResult.error);
+            }
+
             const deleteResult = await deleteBillItem(activeOrg.orgId, bill.id as string);
             if (deleteResult.error) throw new Error(deleteResult.error);
             closeDetail();
@@ -638,10 +677,10 @@ export default function BillsPage() {
                     </div>
 
                     <section className="glass-panel" style={{ padding: 0, overflow: "hidden" }}>
-                        <div style={{ padding: "18px", borderBottom: "1px solid var(--border-color)", display: "grid", gap: "14px" }}>
+                            <div style={{ padding: "18px", borderBottom: "1px solid var(--border-color)", display: "grid", gap: "14px" }}>
                             <div className="search-box">
                                 <Search size={16} />
-                                <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search by bill number or company..." />
+                                <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search by bill number, company, or amount..." />
                             </div>
                             <div className="workspace-toolbar">
                                 <div className="workspace-filter-pill">
@@ -657,6 +696,15 @@ export default function BillsPage() {
                                         </button>
                                     ))}
                                 </div>
+                                <div style={{ minWidth: "220px", width: "100%", maxWidth: "280px" }}>
+                                    <label className="section-label">Sort By</label>
+                                    <select className="input-field" value={billSort} onChange={(e) => setBillSort(e.target.value as BillSort)}>
+                                        <option value="dateDesc">Date: Newest first</option>
+                                        <option value="dateAsc">Date: Oldest first</option>
+                                        <option value="billNumber">Bill Number</option>
+                                        <option value="companyName">Company Name</option>
+                                    </select>
+                                </div>
                             </div>
                         </div>
                         <div style={{ maxHeight: "72vh", overflowY: "auto" }}>
@@ -665,6 +713,9 @@ export default function BillsPage() {
                                     <div>
                                         <div style={{ fontWeight: 700 }}>{bill.billNumber || bill.id}</div>
                                         <div style={{ opacity: 0.76 }}>{bill.vendorName}</div>
+                                        <div style={{ opacity: 0.62, fontSize: "0.86rem" }}>
+                                            {bill.date ? new Date(bill.date).toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" }) : "No bill date"}
+                                        </div>
                                     </div>
                                     <div style={{ textAlign: "right" }}>
                                         <div className="status-pill" style={{ background: bill.billType === "Sale" ? "rgba(22,163,74,.12)" : "rgba(220,38,38,.12)", color: bill.billType === "Sale" ? "#15803d" : "#dc2626" }}>{bill.billType}</div>
@@ -913,7 +964,32 @@ export default function BillsPage() {
                                 </div>
                                 <div className="form-grid-3">
                                     <div><label className="section-label">Freight</label><input className="input-field" inputMode="decimal" placeholder="0" value={toFormNumber(form.freightAndForwardingCharges)} onChange={(e) => setFormNumericField("freightAndForwardingCharges", e.target.value)} /></div>
-                                    <div><label className="section-label">Round Off</label><input className="input-field" inputMode="decimal" placeholder="0" value={toFormNumber(form.roundOff)} onChange={(e) => setFormNumericField("roundOff", e.target.value, true)} /></div>
+                                    <div>
+                                        <label className="section-label">Round Off</label>
+                                        <div style={{ display: "grid", gridTemplateColumns: "120px minmax(0, 1fr)", gap: "8px" }}>
+                                            <select
+                                                className="input-field"
+                                                value={getRoundOffSign(form.roundOff)}
+                                                onChange={(e) => {
+                                                    const sign = e.target.value as "positive" | "negative";
+                                                    setForm((current) => {
+                                                        const next = { ...current, roundOff: applyRoundOffSign(current.roundOff, sign) };
+                                                        return { ...next, ...recalc(next) };
+                                                    });
+                                                }}
+                                            >
+                                                <option value="positive">Positive</option>
+                                                <option value="negative">Negative</option>
+                                            </select>
+                                            <input
+                                                className="input-field"
+                                                inputMode="decimal"
+                                                placeholder="0"
+                                                value={toFormNumber(form.roundOff)}
+                                                onChange={(e) => setFormNumericField("roundOff", e.target.value, true)}
+                                            />
+                                        </div>
+                                    </div>
                                     <div><label className="section-label">Total</label><input className="input-field" value={formatCurrencyINR(form.amount)} disabled /></div>
                                 </div>
                             </div>

@@ -137,7 +137,7 @@ export default function Dashboard() {
           <div className="glass-panel flex-center" style={{ padding: '64px 24px', flexDirection: 'column', gap: '16px', textAlign: 'center' }}>
             <Box size={48} style={{ opacity: 0.5 }} />
             <h3>No Organizations Found</h3>
-            <p style={{ opacity: 0.7, maxWidth: '400px' }}>You aren't a member of any organizations yet. Create a new one or join an existing organization to start managing inventory.</p>
+            <p style={{ opacity: 0.7, maxWidth: '400px' }}>You {`aren't`} a member of any organizations yet. Create a new one or join an existing organization to start managing inventory.</p>
           </div>
         ) : (
           <div className="grid-dashboard">

@@ -415,7 +415,6 @@ export default function OrgHomePage() {
       purchaseTotal,
       profitTotal: salesTotal - purchaseTotal,
       salesTax,
-      salesTax,
       purchaseTax,
       dailyRows,
     };

@@ -122,7 +122,7 @@ function MonthlySummaryTable({
             <th style={{ padding: "12px 10px" }}>Month</th>
             <th style={{ padding: "12px 10px" }}>Sales Amount</th>
             <th style={{ padding: "12px 10px" }}>Purchase Amount</th>
-            <th style={{ padding: "12px 10px" }}>Profit Amount</th>
+            <th style={{ padding: "12px 10px" }}>Balance Amount</th>
           </tr>
         </thead>
         <tbody>
@@ -197,6 +197,7 @@ export default function OrgHomePage() {
     logoUrl: "",
     logoPublicId: "",
     logoResourceType: "image" as "image" | "raw" | "video",
+    expenditures: [] as { id: string; name: string; cost: number }[],
   });
 
   useEffect(() => {
@@ -240,6 +241,7 @@ export default function OrgHomePage() {
       logoUrl: activeOrg.logoUrl || "",
       logoPublicId: activeOrg.logoPublicId || "",
       logoResourceType: activeOrg.logoResourceType || "image",
+      expenditures: activeOrg.expenditures || [],
     });
   }, [activeOrg]);
 
@@ -271,6 +273,16 @@ export default function OrgHomePage() {
       .filter((bill) => bill.billType === "Purchase")
       .reduce((sum, bill) => sum + parseAmount(bill.amount), 0);
     const currentMonthSales = currentMonthSalesOnly - currentMonthPurchaseOnly;
+
+    const currentMonthSalesTax = bills
+      .filter((bill) => String(bill.date || "").startsWith(currentMonthKey))
+      .filter((bill) => bill.billType === "Sale")
+      .reduce((sum, bill) => sum + parseAmount(bill.taxAmount), 0);
+    const currentMonthPurchaseTax = bills
+      .filter((bill) => String(bill.date || "").startsWith(currentMonthKey))
+      .filter((bill) => bill.billType === "Purchase")
+      .reduce((sum, bill) => sum + parseAmount(bill.taxAmount), 0);
+    const currentMonthNetTax = currentMonthSalesTax - currentMonthPurchaseTax;
 
     const previousMonthSalesOnly = bills
       .filter((bill) => String(bill.date || "").startsWith(previousMonthKey))
@@ -345,6 +357,9 @@ export default function OrgHomePage() {
       currentMonthSales,
       currentMonthSalesOnly,
       currentMonthPurchaseOnly,
+      currentMonthSalesTax,
+      currentMonthPurchaseTax,
+      currentMonthNetTax,
       salesDelta,
       recentCompanies,
       totalReceivables,
@@ -373,6 +388,10 @@ export default function OrgHomePage() {
       String(bill.date || "").startsWith(reportMonth),
     );
 
+    const sortedMonthBills = [...monthBills].sort((a, b) =>
+      String(a.date || "").localeCompare(String(b.date || "")),
+    );
+
     const salesTotal = monthBills
       .filter((bill) => bill.billType === "Sale")
       .reduce((sum, bill) => sum + parseAmount(bill.amount), 0);
@@ -385,6 +404,77 @@ export default function OrgHomePage() {
     const purchaseTax = monthBills
       .filter((bill) => bill.billType === "Purchase")
       .reduce((sum, bill) => sum + parseAmount(bill.taxAmount), 0);
+
+    const paymentsReceived = bills
+      .filter((bill) => bill.billType === "Sale" && bill.paymentStatus === "Paid")
+      .filter((bill) => {
+        const pDate = bill.paidDate || bill.date || "";
+        return pDate.startsWith(reportMonth);
+      })
+      .reduce((sum, bill) => sum + parseAmount(bill.amount), 0);
+
+    const paymentsSent = bills
+      .filter((bill) => bill.billType === "Purchase" && bill.paymentStatus === "Paid")
+      .filter((bill) => {
+        const pDate = bill.paidDate || bill.date || "";
+        return pDate.startsWith(reportMonth);
+      })
+      .reduce((sum, bill) => sum + parseAmount(bill.amount), 0);
+
+    const remainingSales = monthBills
+      .filter((bill) => bill.billType === "Sale" && bill.paymentStatus !== "Paid")
+      .reduce((sum, bill) => sum + parseAmount(bill.amount), 0);
+
+    const remainingPurchase = monthBills
+      .filter((bill) => bill.billType === "Purchase" && bill.paymentStatus !== "Paid")
+      .reduce((sum, bill) => sum + parseAmount(bill.amount), 0);
+
+    const paymentBreakdown = {
+      received: {
+        UPI: 0,
+        "NEFT/IMPS": 0,
+        Cash: 0,
+        Cheque: 0,
+      },
+      sent: {
+        UPI: 0,
+        "NEFT/IMPS": 0,
+        Cash: 0,
+        Cheque: 0,
+      }
+    };
+
+    bills
+      .filter((bill) => bill.billType === "Sale" && bill.paymentStatus === "Paid")
+      .filter((bill) => {
+        const pDate = bill.paidDate || bill.date || "";
+        return pDate.startsWith(reportMonth);
+      })
+      .forEach((bill) => {
+        const mode = bill.paidType || "Cash";
+        const amt = parseAmount(bill.amount);
+        if (mode in paymentBreakdown.received) {
+          paymentBreakdown.received[mode as keyof typeof paymentBreakdown.received] += amt;
+        } else {
+          paymentBreakdown.received["Cash"] += amt;
+        }
+      });
+
+    bills
+      .filter((bill) => bill.billType === "Purchase" && bill.paymentStatus === "Paid")
+      .filter((bill) => {
+        const pDate = bill.paidDate || bill.date || "";
+        return pDate.startsWith(reportMonth);
+      })
+      .forEach((bill) => {
+        const mode = bill.paidType || "Cash";
+        const amt = parseAmount(bill.amount);
+        if (mode in paymentBreakdown.sent) {
+          paymentBreakdown.sent[mode as keyof typeof paymentBreakdown.sent] += amt;
+        } else {
+          paymentBreakdown.sent["Cash"] += amt;
+        }
+      });
 
     const dailyRows = Array.from({ length: daysInMonth }, (_, index) => {
       const date = new Date(year, monthIndex, index + 1);
@@ -416,6 +506,12 @@ export default function OrgHomePage() {
       profitTotal: salesTotal - purchaseTotal,
       salesTax,
       purchaseTax,
+      paymentsReceived,
+      paymentsSent,
+      remainingSales,
+      remainingPurchase,
+      paymentBreakdown,
+      sortedMonthBills,
       dailyRows,
     };
   }, [bills, reportMonth]);
@@ -593,22 +689,105 @@ export default function OrgHomePage() {
   };
 
   const exportMonthlyReportPdf = () => {
+    const totalExpenditures = (activeOrg?.expenditures || []).reduce(
+      (sum: number, exp: any) => sum + parseAmount(exp.cost || 0),
+      0
+    );
+    const netTax = monthlyReportData.salesTax - monthlyReportData.purchaseTax;
+    const netProfit = monthlyReportData.salesTotal - monthlyReportData.purchaseTotal - netTax - totalExpenditures;
+
+    const cardBorderClasses: Record<string, string> = {
+      "Sales Total": "border-left: 4px solid #0284c7;",
+      "Purchase Total": "border-left: 4px solid #475569;",
+      "Net Tax Calculated": "border-left: 4px solid #6366f1;",
+      "Total Expenditures": "border-left: 4px solid #f43f5e;",
+      "Net Profit": "border-left: 4px solid " + (netProfit >= 0 ? "#16a34a;" : "#dc2626;"),
+      "Payments Received": "border-left: 4px solid #22c55e;",
+      "Payments Sent": "border-left: 4px solid #3b82f6;",
+      "Remaining Sales": "border-left: 4px solid #f59e0b;",
+      "Remaining Purchase": "border-left: 4px solid #ef4444;"
+    };
+
     const summaryCards = [
-      ["Sales", monthlyReportData.salesTotal],
-      ["Purchase", monthlyReportData.purchaseTotal],
-      ["Profit", monthlyReportData.profitTotal],
-      ["Sales Tax", monthlyReportData.salesTax],
-      ["Purchase Tax", monthlyReportData.purchaseTax],
+      ["Sales Total", monthlyReportData.salesTotal],
+      ["Purchase Total", monthlyReportData.purchaseTotal],
+      ["Net Tax Calculated", netTax],
+      ["Total Expenditures", totalExpenditures],
+      ["Net Profit", netProfit],
+      ["Payments Received", monthlyReportData.paymentsReceived],
+      ["Payments Sent", monthlyReportData.paymentsSent],
+      ["Remaining Sales", monthlyReportData.remainingSales],
+      ["Remaining Purchase", monthlyReportData.remainingPurchase],
     ]
       .map(
         ([label, value]) => `
-          <div class="card">
+          <div class="card" style="${cardBorderClasses[String(label)] || ''}">
             <div class="label">${escapeHtml(String(label))}</div>
             <div class="value">${escapeHtml(formatCurrencyINR(Number(value)))}</div>
           </div>
         `,
       )
       .join("");
+
+    const billRows = monthlyReportData.sortedMonthBills
+      .map((bill) => {
+        const grossAmount = parseAmount(bill.grossAmount || 0);
+        const taxAmount = parseAmount(bill.taxAmount || 0);
+        const totalAmount = parseAmount(bill.amount || 0);
+        const status = bill.paymentStatus || "Unpaid";
+        const paidAmount = status === "Paid" ? totalAmount : 0;
+        const remainingAmount = status !== "Paid" ? totalAmount : 0;
+        const mode = status === "Paid"
+          ? (bill.paidType || "Cash") + (bill.chequeNumber ? ` (Chq: ${bill.chequeNumber})` : "")
+          : "-";
+
+        return `
+          <tr>
+            <td>${escapeHtml(bill.date || "")}</td>
+            <td><strong>${escapeHtml(bill.billNumber || "")}</strong></td>
+            <td>${escapeHtml(bill.vendorName || "")}</td>
+            <td>
+              <span style="font-weight: 600; color: ${bill.billType === "Sale" ? "#0284c7" : "#475569"}">
+                ${escapeHtml(bill.billType || "")}
+              </span>
+            </td>
+            <td>${escapeHtml(formatCurrencyINR(grossAmount))}</td>
+            <td>${escapeHtml(formatCurrencyINR(taxAmount))}</td>
+            <td><strong>${escapeHtml(formatCurrencyINR(totalAmount))}</strong></td>
+            <td>
+              <span class="status-badge" style="background: ${status === "Paid" ? "#dcfce7" : "#fee2e2"}; color: ${status === "Paid" ? "#15803d" : "#b91c1c"};">
+                ${escapeHtml(status)}
+              </span>
+            </td>
+            <td>${escapeHtml(mode)}</td>
+            <td>${escapeHtml(formatCurrencyINR(paidAmount))}</td>
+            <td style="font-weight: 600; color: ${remainingAmount > 0 ? "#b91c1c" : "inherit"};">
+              ${escapeHtml(formatCurrencyINR(remainingAmount))}
+            </td>
+          </tr>
+        `;
+      })
+      .join("");
+
+    const billGrossTotal = monthlyReportData.sortedMonthBills.reduce((sum, b) => sum + parseAmount(b.grossAmount || 0), 0);
+    const billTaxTotal = monthlyReportData.sortedMonthBills.reduce((sum, b) => sum + parseAmount(b.taxAmount || 0), 0);
+    const billTotalTotal = monthlyReportData.sortedMonthBills.reduce((sum, b) => sum + parseAmount(b.amount || 0), 0);
+    const billPaidTotal = monthlyReportData.sortedMonthBills.reduce((sum, b) => sum + parseAmount(b.paymentStatus === "Paid" ? b.amount : 0), 0);
+    const billRemainingTotal = monthlyReportData.sortedMonthBills.reduce((sum, b) => sum + parseAmount(b.paymentStatus !== "Paid" ? b.amount : 0), 0);
+
+    const billTableFooter = `
+      <tfoot>
+        <tr style="font-weight: bold; background: #e2e8f0;">
+          <td colspan="4" style="text-align: right; padding: 8px; border: 1px solid #cbd5e1;">Grand Total:</td>
+          <td style="padding: 8px; border: 1px solid #cbd5e1;">${escapeHtml(formatCurrencyINR(billGrossTotal))}</td>
+          <td style="padding: 8px; border: 1px solid #cbd5e1;">${escapeHtml(formatCurrencyINR(billTaxTotal))}</td>
+          <td style="padding: 8px; border: 1px solid #cbd5e1;">${escapeHtml(formatCurrencyINR(billTotalTotal))}</td>
+          <td colspan="2" style="padding: 8px; border: 1px solid #cbd5e1; text-align: center;">-</td>
+          <td style="padding: 8px; border: 1px solid #cbd5e1;">${escapeHtml(formatCurrencyINR(billPaidTotal))}</td>
+          <td style="padding: 8px; border: 1px solid #cbd5e1;">${escapeHtml(formatCurrencyINR(billRemainingTotal))}</td>
+        </tr>
+      </tfoot>
+    `;
 
     const dailyRows = monthlyReportData.dailyRows
       .filter((row) => row.sales > 0 || row.purchase > 0)
@@ -626,14 +805,298 @@ export default function OrgHomePage() {
     openPrintWindow(
       `${activeOrg.name} Monthly Report ${monthlyReportData.monthLabel}`,
       `
-        <h1>${escapeHtml(activeOrg.name)} Monthly Report</h1>
-        <p class="meta">${escapeHtml(monthlyReportData.monthLabel)} • Generated on ${escapeHtml(new Date().toLocaleString("en-IN"))}</p>
-        <div class="grid">${summaryCards}</div>
+        <style>
+          @media print {
+            @page {
+              size: landscape;
+              margin: 10mm;
+            }
+            body {
+              padding: 0;
+            }
+          }
+          .company-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            border-bottom: 2px solid #0f172a;
+            padding-bottom: 18px;
+            margin-bottom: 24px;
+          }
+          .company-info-block {
+            display: flex;
+            gap: 16px;
+            align-items: center;
+          }
+          .company-logo {
+            width: 72px;
+            height: 72px;
+            object-fit: cover;
+            border-radius: 12px;
+            border: 1px solid #cbd5e1;
+          }
+          .company-name {
+            font-size: 24px;
+            font-weight: 800;
+            color: #0f172a;
+            line-height: 1.2;
+          }
+          .company-detail-line {
+            font-size: 11px;
+            color: #475569;
+            margin-top: 3px;
+          }
+          .report-info-block {
+            text-align: right;
+          }
+          .report-title {
+            font-size: 20px;
+            font-weight: 700;
+            color: #0284c7;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+          }
+          .report-month {
+            font-size: 14px;
+            font-weight: 600;
+            color: #0f172a;
+            margin-top: 4px;
+          }
+          .report-meta {
+            font-size: 10px;
+            color: #64748b;
+            margin-top: 6px;
+          }
+          .report-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 15px;
+            font-size: 11px;
+          }
+          .report-table th {
+            background-color: #f1f5f9;
+            color: #334155;
+            font-weight: 600;
+            text-transform: uppercase;
+            font-size: 9px;
+            letter-spacing: 0.05em;
+            border: 1px solid #cbd5e1;
+            padding: 8px;
+            text-align: left;
+          }
+          .report-table td {
+            border: 1px solid #e2e8f0;
+            padding: 8px;
+            color: #334155;
+            vertical-align: middle;
+          }
+          .report-table tr:nth-child(even) {
+            background-color: #f8fafc;
+          }
+          .status-badge {
+            display: inline-block;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-weight: bold;
+            font-size: 9px;
+          }
+          .page-break {
+            page-break-before: always;
+          }
+        </style>
+
+        <div class="company-header">
+          <div class="company-info-block">
+            ${activeOrg.logoPublicId ? `
+              <img
+                src="${window.location.origin}/api/bills/file?publicId=${encodeURIComponent(activeOrg.logoPublicId)}&resourceType=${encodeURIComponent(activeOrg.logoResourceType || 'image')}"
+                alt="Logo"
+                class="company-logo"
+              />
+            ` : ""}
+            <div class="company-text">
+              <div class="company-name">${escapeHtml(activeOrg.name)}</div>
+              ${activeOrg.address ? `<div class="company-detail-line">${escapeHtml(activeOrg.address)}</div>` : ""}
+              ${activeOrg.gst ? `<div class="company-detail-line"><strong>GST:</strong> ${escapeHtml(activeOrg.gst)}</div>` : ""}
+              ${activeOrg.bankDetails ? `<div class="company-detail-line"><strong>Bank:</strong> ${escapeHtml(activeOrg.bankDetails)}</div>` : ""}
+            </div>
+          </div>
+          <div class="report-info-block">
+            <div class="report-title">Monthly Report</div>
+            <div class="report-month">${escapeHtml(monthlyReportData.monthLabel)}</div>
+            <div class="report-meta">Generated: ${escapeHtml(new Date().toLocaleString("en-IN"))}</div>
+          </div>
+        </div>
+
+        <div class="grid" style="grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; margin: 18px 0 24px;">
+          ${summaryCards}
+        </div>
+
+        <div style="display: flex; gap: 24px; margin-top: 20px; margin-bottom: 24px; align-items: flex-start;">
+          <div class="section" style="flex: 1; min-width: 300px; max-width: 550px; margin-top: 0;">
+            <h2 style="font-size: 14px; color: #0f172a; margin-bottom: 8px;">Payment Modes Breakdown</h2>
+            <table class="report-table" style="width: 100%; margin-top: 0;">
+              <thead>
+                <tr>
+                  <th>Payment Mode</th>
+                  <th>Payments Received (Sales)</th>
+                  <th>Payments Sent (Purchase)</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><strong>UPI</strong></td>
+                  <td>${escapeHtml(formatCurrencyINR(monthlyReportData.paymentBreakdown.received.UPI))}</td>
+                  <td>${escapeHtml(formatCurrencyINR(monthlyReportData.paymentBreakdown.sent.UPI))}</td>
+                </tr>
+                <tr>
+                  <td><strong>NEFT/IMPS</strong></td>
+                  <td>${escapeHtml(formatCurrencyINR(monthlyReportData.paymentBreakdown.received["NEFT/IMPS"]))}</td>
+                  <td>${escapeHtml(formatCurrencyINR(monthlyReportData.paymentBreakdown.sent["NEFT/IMPS"]))}</td>
+                </tr>
+                <tr>
+                  <td><strong>Cash</strong></td>
+                  <td>${escapeHtml(formatCurrencyINR(monthlyReportData.paymentBreakdown.received.Cash))}</td>
+                  <td>${escapeHtml(formatCurrencyINR(monthlyReportData.paymentBreakdown.sent.Cash))}</td>
+                </tr>
+                <tr>
+                  <td><strong>Cheque</strong></td>
+                  <td>${escapeHtml(formatCurrencyINR(monthlyReportData.paymentBreakdown.received.Cheque))}</td>
+                  <td>${escapeHtml(formatCurrencyINR(monthlyReportData.paymentBreakdown.sent.Cheque))}</td>
+                </tr>
+              </tbody>
+              <tfoot>
+                <tr style="font-weight: bold; background: #e2e8f0;">
+                  <td style="padding: 8px; border: 1px solid #cbd5e1;">Total Paid:</td>
+                  <td style="padding: 8px; border: 1px solid #cbd5e1;">${escapeHtml(formatCurrencyINR(monthlyReportData.paymentsReceived))}</td>
+                  <td style="padding: 8px; border: 1px solid #cbd5e1;">${escapeHtml(formatCurrencyINR(monthlyReportData.paymentsSent))}</td>
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+
+          ${activeOrg.expenditures && activeOrg.expenditures.length > 0 ? `
+            <div class="section" style="flex: 1; min-width: 300px; max-width: 450px; margin-top: 0;">
+              <h2 style="font-size: 14px; color: #0f172a; margin-bottom: 8px;">Monthly Expenditures</h2>
+              <table class="report-table" style="width: 100%; margin-top: 0;">
+                <thead>
+                  <tr>
+                    <th>Expenditure Name</th>
+                    <th style="text-align: right;">Cost</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${activeOrg.expenditures.map((exp: any) => `
+                    <tr>
+                      <td><strong>${escapeHtml(exp.name)}</strong></td>
+                      <td style="text-align: right;">${escapeHtml(formatCurrencyINR(Number(exp.cost || 0)))}</td>
+                    </tr>
+                  `).join("")}
+                </tbody>
+                <tfoot>
+                  <tr style="font-weight: bold; background: #e2e8f0;">
+                    <td style="padding: 8px; border: 1px solid #cbd5e1;">Total Expenditures:</td>
+                    <td style="padding: 8px; border: 1px solid #cbd5e1; text-align: right;">${escapeHtml(formatCurrencyINR(totalExpenditures))}</td>
+                  </tr>
+                </tfoot>
+              </table>
+            </div>
+          ` : ""}
+        </div>
+
+        <div class="section" style="margin-top: 24px; margin-bottom: 24px;">
+          <h2 style="font-size: 14px; color: #0f172a; margin-bottom: 8px;">Financial Statement & Net Profit Calculation</h2>
+          <table class="report-table" style="max-width: 650px; font-size: 11px;">
+            <thead>
+              <tr style="background: #0f172a; color: #ffffff;">
+                <th style="background: #0f172a; color: #ffffff; font-weight: bold; padding: 6px 8px;">Calculation Step</th>
+                <th style="background: #0f172a; color: #ffffff; font-weight: bold; text-align: right; padding: 6px 8px;">Amount</th>
+                <th style="background: #0f172a; color: #ffffff; font-weight: bold; padding: 6px 8px;">Formula / Explanation</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>Total Sales Revenue</strong></td>
+                <td style="text-align: right; font-weight: 600; color: #0284c7;">${escapeHtml(formatCurrencyINR(monthlyReportData.salesTotal))}</td>
+                <td>Cumulative Sales invoiced (Tax Inclusive)</td>
+              </tr>
+              <tr>
+                <td><strong>Total Purchases Cost</strong></td>
+                <td style="text-align: right; font-weight: 600; color: #475569;">(${escapeHtml(formatCurrencyINR(monthlyReportData.purchaseTotal))})</td>
+                <td>Cumulative Purchases invoiced (Tax Inclusive)</td>
+              </tr>
+              <tr style="background-color: #f1f5f9; font-weight: 600;">
+                <td>Gross Trading Profit</td>
+                <td style="text-align: right; color: ${monthlyReportData.salesTotal - monthlyReportData.purchaseTotal >= 0 ? "#15803d" : "#b91c1c"};">${escapeHtml(formatCurrencyINR(monthlyReportData.salesTotal - monthlyReportData.purchaseTotal))}</td>
+                <td>Total Sales - Total Purchases</td>
+              </tr>
+              <tr>
+                <td>Sales Output Tax (GST Collected)</td>
+                <td style="text-align: right; color: #4f46e5;">${escapeHtml(formatCurrencyINR(monthlyReportData.salesTax))}</td>
+                <td>Tax liability collected on sales</td>
+              </tr>
+              <tr>
+                <td>Purchase Input Tax (GST Credit)</td>
+                <td style="text-align: right; color: #4f46e5;">(${escapeHtml(formatCurrencyINR(monthlyReportData.purchaseTax))})</td>
+                <td>Input tax paid on purchases (Input Tax Credit)</td>
+              </tr>
+              <tr style="background-color: #f8fafc;">
+                <td><strong>Net Tax Calculated</strong></td>
+                <td style="text-align: right; font-weight: 600; color: #4f46e5;">${escapeHtml(formatCurrencyINR(netTax))}</td>
+                <td>Sales Tax - Purchase Tax (Liability offset)</td>
+              </tr>
+              <tr>
+                <td><strong>Total Operating Expenditures</strong></td>
+                <td style="text-align: right; font-weight: 600; color: #dc2626;">(${escapeHtml(formatCurrencyINR(totalExpenditures))})</td>
+                <td>Overhead expenses (Rent, Salaries, Utilities, etc.)</td>
+              </tr>
+              <tr style="background: #dcfce7; font-weight: bold; border-top: 1.5px solid #16a34a; border-bottom: 1.5px solid #16a34a;">
+                <td style="color: #14532d; padding: 8px;">NET PROFIT AFTER TAXES & EXPENSES</td>
+                <td style="text-align: right; color: ${netProfit >= 0 ? "#14532d" : "#7f1d1d"}; padding: 8px;">${escapeHtml(formatCurrencyINR(netProfit))}</td>
+                <td style="color: #14532d; padding: 8px;">Gross Trading Profit - Net Tax - Total Operating Expenditures</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        
         <div class="section">
+          <h2>All Monthly Bills</h2>
+          <table class="report-table">
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Bill Number</th>
+                <th>Company Name</th>
+                <th>Type</th>
+                <th>Gross Amount</th>
+                <th>Tax Amount</th>
+                <th>Total Amount</th>
+                <th>Status</th>
+                <th>Payment Mode</th>
+                <th>Paid Amount</th>
+                <th>Remaining Amount</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${billRows || '<tr><td colspan="11" style="text-align: center; padding: 20px; color: #64748b;">No bills found for this month.</td></tr>'}
+            </tbody>
+            ${billRows ? billTableFooter : ""}
+          </table>
+        </div>
+
+        <div class="section page-break">
           <h2>Day-to-Day Sales and Purchase</h2>
-          <table>
-            <thead><tr><th>Date</th><th>Sales</th><th>Purchase</th></tr></thead>
-            <tbody>${dailyRows || '<tr><td colspan="3">No daily records for this month.</td></tr>'}</tbody>
+          <table class="report-table">
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Sales</th>
+                <th>Purchase</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${dailyRows || '<tr><td colspan="3" style="text-align: center; padding: 20px; color: #64748b;">No daily records for this month.</td></tr>'}
+            </tbody>
           </table>
         </div>
       `,
@@ -872,17 +1335,85 @@ export default function OrgHomePage() {
                   </label>
                 </div>
               </div>
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "flex-end",
-                  justifyContent: "flex-end",
-                }}
-              >
-                <button className="btn-primary" disabled={savingProfile}>
-                  {savingProfile ? "Saving..." : "Save Organization"}
+            </div>
+
+            <div style={{ marginTop: "16px", borderTop: "1px solid var(--border-color)", paddingTop: "16px" }}>
+              <h3 style={{ marginBottom: "6px", fontSize: "1.1rem", fontWeight: 600 }}>Expenditures</h3>
+              <p style={{ fontSize: "0.85rem", opacity: 0.7, marginBottom: "12px" }}>
+                Add monthly overhead or operation costs (e.g., Rent, Salaries, Utilities) to subtract from profit calculations.
+              </p>
+              <div style={{ display: "grid", gap: "10px", marginBottom: "16px" }}>
+                {profileForm.expenditures.map((exp, idx) => (
+                  <div key={exp.id || idx} style={{ display: "flex", gap: "12px", alignItems: "center" }}>
+                    <input
+                      placeholder="Expenditure Name"
+                      className="input-field"
+                      value={exp.name}
+                      onChange={(e) => {
+                        const next = [...profileForm.expenditures];
+                        next[idx] = { ...next[idx], name: e.target.value };
+                        setProfileForm({ ...profileForm, expenditures: next });
+                      }}
+                      required
+                      style={{ flex: 2 }}
+                    />
+                    <input
+                      placeholder="Cost"
+                      type="number"
+                      className="input-field"
+                      value={exp.cost || ""}
+                      onChange={(e) => {
+                        const next = [...profileForm.expenditures];
+                        next[idx] = { ...next[idx], cost: Number(e.target.value) };
+                        setProfileForm({ ...profileForm, expenditures: next });
+                      }}
+                      required
+                      style={{ flex: 1 }}
+                    />
+                    <button
+                      type="button"
+                      style={{ color: "#dc2626", background: "none", border: "none", cursor: "pointer", fontSize: "0.875rem", padding: "8px" }}
+                      onClick={() => {
+                        const next = profileForm.expenditures.filter((_, i) => i !== idx);
+                        setProfileForm({ ...profileForm, expenditures: next });
+                      }}
+                    >
+                      Remove
+                    </button>
+                  </div>
+                ))}
+                <button
+                  type="button"
+                  className="btn-secondary"
+                  style={{ width: "fit-content", padding: "8px 12px", fontSize: "0.875rem" }}
+                  onClick={() => {
+                    const newExp = {
+                      id: "EXP-" + Math.random().toString(36).slice(2, 9).toUpperCase(),
+                      name: "",
+                      cost: 0
+                    };
+                    setProfileForm({
+                      ...profileForm,
+                      expenditures: [...profileForm.expenditures, newExp]
+                    });
+                  }}
+                >
+                  + Add Expenditure
                 </button>
               </div>
+            </div>
+
+            <div
+              style={{
+                display: "flex",
+                alignItems: "flex-end",
+                justifyContent: "flex-end",
+                marginTop: "8px",
+              }}
+            >
+              <button className="btn-primary" disabled={savingProfile}>
+                {savingProfile ? "Saving..." : "Save Organization"}
+              </button>
             </div>
           </form>
         </section>
@@ -1016,9 +1547,85 @@ export default function OrgHomePage() {
                   Purchase:{" "}
                   {formatCurrencyINR(dashboardData.currentMonthPurchaseOnly)}
                 </div>
+                <div style={{ fontSize: "0.88rem", opacity: 0.78 }}>
+                  Net Tax (GST):{" "}
+                  {formatCurrencyINR(dashboardData.currentMonthNetTax)}
+                </div>
+                {activeOrg.expenditures && activeOrg.expenditures.length > 0 && (
+                  <div style={{ fontSize: "0.88rem", opacity: 0.78 }}>
+                    Expenditures:{" "}
+                    {formatCurrencyINR(
+                      activeOrg.expenditures.reduce(
+                        (sum: number, exp: any) => sum + Number(exp.cost || 0),
+                        0
+                      )
+                    )}
+                  </div>
+                )}
+                <div
+                  style={{
+                    marginTop: "8px",
+                    borderTop: "1px solid var(--border-color)",
+                    paddingTop: "8px",
+                    fontSize: "0.95rem",
+                    fontWeight: 600,
+                    opacity: 0.95,
+                  }}
+                >
+                  Net Profit:{" "}
+                  {formatCurrencyINR(
+                    dashboardData.currentMonthSales -
+                      dashboardData.currentMonthNetTax -
+                      (activeOrg.expenditures || []).reduce(
+                        (sum: number, exp: any) => sum + Number(exp.cost || 0),
+                        0
+                      )
+                  )}
+                </div>
               </div>
             </section>
           </div>
+
+          {activeOrg.expenditures && activeOrg.expenditures.length > 0 && (
+            <section className="glass-panel" style={{ marginTop: "24px" }}>
+              <div className="section-header-row" style={{ marginBottom: "12px" }}>
+                <div>
+                  <p className="section-kicker">Operations</p>
+                  <h2 className="section-title">Operational Expenditures</h2>
+                </div>
+              </div>
+              <div className="table-container">
+                <table className="inventory-table">
+                  <thead>
+                    <tr>
+                      <th>Expense ID</th>
+                      <th>Expenditure Name</th>
+                      <th style={{ textAlign: "right" }}>Cost</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {activeOrg.expenditures.map((exp: any) => (
+                      <tr key={exp.id}>
+                        <td><code>{exp.id}</code></td>
+                        <td><strong>{exp.name}</strong></td>
+                        <td style={{ textAlign: "right", fontWeight: 600 }}>{formatCurrencyINR(exp.cost)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                  <tfoot>
+                    <tr style={{ fontWeight: "bold", background: "var(--hover-bg)" }}>
+                      <td colSpan={2} style={{ textAlign: "right" }}>Total Monthly Expenditures:</td>
+                      <td style={{ textAlign: "right" }}>
+                        {formatCurrencyINR(
+                          activeOrg.expenditures.reduce((sum: number, e: any) => sum + Number(e.cost || 0), 0)
+                        )}
+                      </td>
+                    </tr>
+                  </tfoot>
+                </table>
+              </div>
+            </section>
+          )}
         </>
       ) : (
         <div className="outstanding-layout">
@@ -1245,7 +1852,7 @@ export default function OrgHomePage() {
             className="modal-content glass-panel"
             onClick={(e) => e.stopPropagation()}
             style={{
-              background: "#ffffff",
+              background: "var(--glass-bg)",
               padding: "28px",
               borderRadius: "16px",
               width: "100%",
@@ -1254,7 +1861,7 @@ export default function OrgHomePage() {
             }}
           >
             <div className="modal-header" style={{ marginBottom: "20px" }}>
-              <h2 style={{ margin: 0, fontSize: "1.35rem", fontWeight: 700, color: "#0f172a" }}>Generate Monthly Report</h2>
+              <h2 style={{ margin: 0, fontSize: "1.35rem", fontWeight: 700, color: "var(--text-color)" }}>Generate Monthly Report</h2>
             </div>
             <div className="modal-body" style={{ marginBottom: "28px" }}>
               <label className="section-label" style={{ display: "block", marginBottom: "8px" }}>Select Month</label>
@@ -1265,7 +1872,7 @@ export default function OrgHomePage() {
                 onChange={(e) => setReportMonth(e.target.value)}
                 style={{ width: "100%", padding: "12px", fontSize: "1rem" }}
               />
-              <p style={{ marginTop: "14px", fontSize: "0.9rem", color: "#64748b", lineHeight: 1.5 }}>
+              <p style={{ marginTop: "14px", fontSize: "0.9rem", color: "var(--muted-text)", lineHeight: 1.5 }}>
                 The generated PDF will include day-to-day sales and purchase data, total sales, purchases, profit, and tax for the selected month.
               </p>
             </div>

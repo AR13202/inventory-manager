@@ -24,6 +24,7 @@ export interface OrganizationProfile {
     logoUrl?: string;
     logoPublicId?: string;
     logoResourceType?: "image" | "raw" | "video";
+    expenditures?: { id: string; name: string; cost: number }[];
 }
 
 export const createOrganization = async (name: string, password: string, currentUser: User, currentUserName: string) => {
@@ -110,7 +111,7 @@ export const getOrganizationsForUser = async (uid: string) => {
 
 export const updateOrganizationProfile = async (
     orgId: string,
-    updates: Partial<Pick<OrganizationProfile, "name" | "address" | "gst" | "bankDetails" | "logoUrl" | "logoPublicId" | "logoResourceType">>
+    updates: Partial<OrganizationProfile>
 ) => {
     try {
         const orgRef = doc(db, "organizations", orgId);

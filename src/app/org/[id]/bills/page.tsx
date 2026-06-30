@@ -91,7 +91,8 @@ const emptyForm = (): FormState => ({
     photoResourceType: "image",
     fileHash: "",
     fileName: "",
-    fileMimeType: ""
+    fileMimeType: "",
+    photos: []
 });
 
 const recalc = (form: FormState) => {
@@ -130,6 +131,8 @@ export default function BillsPage() {
     const [query, setQuery] = useState("");
     const [billFilter, setBillFilter] = useState<BillFilter>("All");
     const [billSort, setBillSort] = useState<BillSort>("dateDesc");
+    const [fromDate, setFromDate] = useState("");
+    const [toDate, setToDate] = useState("");
     const [editingId, setEditingId] = useState<string | null>(null);
     const [selectedId, setSelectedId] = useState<string | null>(null);
     const [showForm, setShowForm] = useState(searchParams.get("mode") === "new");
@@ -158,9 +161,16 @@ export default function BillsPage() {
     }, [activeOrg, user]);
 
     useEffect(() => {
-        if (searchParams.get("mode") === "new") openNew();
+        const mode = searchParams.get("mode");
+        const id = searchParams.get("id");
+        if (mode === "new") {
+            openNew();
+        } else if (mode === "edit" && id && bills.length > 0) {
+            const bill = bills.find((b) => b.id === id);
+            if (bill) openEdit(bill);
+        }
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [searchParams]);
+    }, [searchParams, bills]);
 
     useEffect(() => {
         const onPointerDown = (event: MouseEvent) => {
@@ -177,6 +187,8 @@ export default function BillsPage() {
 
         return [...bills].filter((bill) => {
             const matchesFilter = billFilter === "All" ? true : bill.billType === billFilter;
+            const matchesFromDate = fromDate ? bill.date >= fromDate : true;
+            const matchesToDate = toDate ? bill.date <= toDate : true;
             const amountString = String(Number(bill.amount || 0));
             const amountFormatted = formatCurrencyINR(Number(bill.amount || 0)).toLowerCase();
             const matchesQuery = !q
@@ -185,7 +197,7 @@ export default function BillsPage() {
                     || (bill.billNumber || "").toLowerCase().includes(q)
                     || amountString.includes(q)
                     || amountFormatted.includes(q);
-            return matchesFilter && matchesQuery;
+            return matchesFilter && matchesFromDate && matchesToDate && matchesQuery;
         }).sort((a, b) => {
             if (billSort === "dateAsc" || billSort === "dateDesc") {
                 const aTime = a.date ? new Date(a.date).getTime() : 0;
@@ -199,18 +211,18 @@ export default function BillsPage() {
 
             return String(a.vendorName || "").localeCompare(String(b.vendorName || ""), undefined, { sensitivity: "base" });
         });
-    }, [bills, query, billFilter, billSort]);
+    }, [bills, query, billFilter, billSort, fromDate, toDate]);
 
     const selected = useMemo(() => bills.find((bill) => bill.id === selectedId) || null, [bills, selectedId]);
     const purchaseCount = useMemo(() => bills.filter((bill) => bill.billType === "Purchase").length, [bills]);
     const saleCount = useMemo(() => bills.filter((bill) => bill.billType === "Sale").length, [bills]);
     const companySuggestions = useMemo(() => {
         const vendorName = String(form.vendorName || "").trim().toLowerCase();
-        if (!vendorName || editingId) return [];
+        if (!vendorName) return [];
         return companies
             .filter((company) => company.name.toLowerCase().includes(vendorName))
             .slice(0, 6);
-    }, [companies, editingId, form.vendorName]);
+    }, [companies, form.vendorName]);
     const showListPanel = !showForm && !selected;
 
     const openNew = () => {
@@ -258,7 +270,15 @@ export default function BillsPage() {
             paymentStatus: bill.paymentStatus || "Unpaid",
             paidDate: bill.paidDate || "",
             paidType: bill.paidType || "NEFT/IMPS",
-            chequeNumber: bill.chequeNumber || ""
+            chequeNumber: bill.chequeNumber || "",
+            photos: bill.photos || (bill.photoUrl ? [{
+                url: bill.photoUrl,
+                publicId: bill.photoPublicId || "",
+                resourceType: bill.photoResourceType || "image",
+                name: bill.fileName || "",
+                mimeType: bill.fileMimeType || "",
+                hash: bill.fileHash || ""
+            }] : [])
         });
         setPreviewSrc(getBillAssetUrl(bill));
         setPreviewLabel(bill.fileName || bill.billNumber);
@@ -313,64 +333,84 @@ export default function BillsPage() {
     };
 
     const onFile = async (event: React.ChangeEvent<HTMLInputElement>) => {
-        const file = event.target.files?.[0];
-        if (!file) return;
+        const files = event.target.files;
+        if (!files || files.length === 0) return;
         setScanning(true);
         setError("");
 
         try {
-            const fileHash = await hashFile(file);
-            if (bills.some((bill) => bill.fileHash === fileHash && bill.id !== editingId)) {
-                throw new Error("This bill file is already uploaded. Duplicate scanned copies are blocked.");
+            const newPhotos = [...(form.photos || [])];
+            let autoFilled = false;
+
+            for (let i = 0; i < files.length; i++) {
+                const file = files[i];
+                const fileHash = await hashFile(file);
+
+                if (bills.some((bill) => bill.fileHash === fileHash && bill.id !== editingId) || 
+                    newPhotos.some((photo) => photo.hash === fileHash)) {
+                    setError("One of the selected files has already been uploaded as a duplicate.");
+                    continue;
+                }
+
+                const fileDataUrl = await readDataUrl(file);
+                const photoObj = {
+                    url: fileDataUrl,
+                    publicId: "",
+                    resourceType: (file.type.includes("pdf") ? "raw" : "image") as "raw" | "image",
+                    name: file.name,
+                    mimeType: file.type,
+                    hash: fileHash
+                };
+
+                newPhotos.push(photoObj);
+
+                // Scan the first new photo to auto-fill details if not scanned already and not editing
+                if (!autoFilled && !editingId) {
+                    const parsed = await scanReceipt(fileDataUrl);
+                    const billType = parsed.billType === "Unknown" ? normalizeBillType(form.billType) : normalizeBillType(parsed.billType);
+                    const company = billType === "Purchase" ? parsed.parentCompanyDetails : parsed.customerCompanyDetails;
+                    const parsedItems = parsed.items || [];
+                    const products = parsedItems.length > 0 ? parsedItems.map((item) => {
+                        const found = inventory.find((inv) => inv.name.toLowerCase() === String(item.name || "").toLowerCase());
+                        return {
+                            name: item.name || "",
+                            quantity: toFormNumber(item.quantity || 1),
+                            unit: item.unit || found?.unit || "",
+                            price: toFormNumber(item.price || 0),
+                            hsn: item.hsn || found?.hsn || "",
+                            category: item.category || found?.category || "Trade"
+                        };
+                    }) : form.products || [];
+
+                    setForm((current) => ({
+                        ...current,
+                        billNumber: sanitizeBillNumber(parsed.billNumber) || current.billNumber,
+                        vendorName: company?.name || current.vendorName,
+                        vendorGst: company?.gst || "",
+                        vendorAddress: company?.address || "",
+                        vendorPhone: company?.phoneNumbers || "",
+                        billType,
+                        date: parsed.date || current.date,
+                        products,
+                        taxDetails: (parsed.taxDetails || []).map((tax) => ({
+                            taxType: tax.taxType || "Tax",
+                            taxPercentage: toFormNumber(tax.taxPercentage || 0),
+                            taxAmount: toFormNumber(tax.taxAmount || 0)
+                        })),
+                        freightAndForwardingCharges: toFormNumber(parsed.freightAndForwardingCharges || 0),
+                        roundOff: toFormNumber(parsed.roundOff || 0),
+                        isScanned: true
+                    }));
+
+                    setParsedCompanies({ parent: parsed.parentCompanyDetails, customer: parsed.customerCompanyDetails });
+                    autoFilled = true;
+                }
             }
 
-            const fileDataUrl = await readDataUrl(file);
-            const parsed = await scanReceipt(fileDataUrl);
-            const billType = parsed.billType === "Unknown" ? normalizeBillType(form.billType) : normalizeBillType(parsed.billType);
-            const company = billType === "Purchase" ? parsed.parentCompanyDetails : parsed.customerCompanyDetails;
-            const parsedItems = parsed.items || [];
-            const products = parsedItems.length > 0 ? parsedItems.map((item) => {
-                const found = inventory.find((inv) => inv.name.toLowerCase() === String(item.name || "").toLowerCase());
-                return {
-                    name: item.name || "",
-                    quantity: toFormNumber(item.quantity || 1),
-                    unit: item.unit || found?.unit || "",
-                    price: toFormNumber(item.price || 0),
-                    hsn: item.hsn || found?.hsn || "",
-                    category: item.category || found?.category || "Trade"
-                };
-            }) : form.products || [];
-
-            const nextForm: FormState = {
-                ...form,
-                billNumber: sanitizeBillNumber(parsed.billNumber) || form.billNumber,
-                vendorName: company?.name || form.vendorName,
-                vendorGst: company?.gst || "",
-                vendorAddress: company?.address || "",
-                vendorPhone: company?.phoneNumbers || "",
-                billType,
-                date: parsed.date || form.date,
-                products,
-                taxDetails: (parsed.taxDetails || []).map((tax) => ({
-                    taxType: tax.taxType || "Tax",
-                    taxPercentage: toFormNumber(tax.taxPercentage || 0),
-                    taxAmount: toFormNumber(tax.taxAmount || 0)
-                })),
-                freightAndForwardingCharges: toFormNumber(parsed.freightAndForwardingCharges || 0),
-                roundOff: toFormNumber(parsed.roundOff || 0),
-                isScanned: true,
-                photoUrl: fileDataUrl,
-                photoPublicId: "",
-                photoResourceType: file.type.includes("pdf") ? "raw" : "image",
-                fileHash,
-                fileName: file.name,
-                fileMimeType: file.type
-            };
-
-            setParsedCompanies({ parent: parsed.parentCompanyDetails, customer: parsed.customerCompanyDetails });
-            setPreviewSrc(file.type.includes("image/") ? fileDataUrl : "");
-            setPreviewLabel(file.name);
-            setForm({ ...nextForm, ...recalc(nextForm), amount: Number(parsed.totalAmount || recalc(nextForm).amount) });
+            setForm((current) => {
+                const next = { ...current, photos: newPhotos };
+                return { ...next, ...recalc(next) };
+            });
         } catch (scanError: any) {
             setError(scanError.message || "Failed to scan file.");
         } finally {
@@ -379,31 +419,34 @@ export default function BillsPage() {
         }
     };
 
-    const uploadIfNeeded = async (currentForm: FormState) => {
-        if (!currentForm.isScanned || !currentForm.photoUrl || !currentForm.photoUrl.startsWith("data:")) {
-            return {
-                photoUrl: currentForm.photoUrl,
-                photoPublicId: currentForm.photoPublicId,
-                photoResourceType: currentForm.photoResourceType
-            };
+    const uploadPhotosIfNeeded = async (photos: any[]) => {
+        const uploadedPhotos = [];
+        for (const photo of photos) {
+            if (photo.url && photo.url.startsWith("data:")) {
+                const response = await fetch("/api/upload", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        file: photo.url,
+                        fileName: photo.name,
+                        mimeType: photo.mimeType
+                    })
+                });
+                const data = await response.json();
+                if (!response.ok || !data.success) throw new Error(data.error || "Failed to upload bill file.");
+                uploadedPhotos.push({
+                    url: data.url,
+                    publicId: data.publicId,
+                    resourceType: data.resourceType as "image" | "raw" | "video",
+                    name: photo.name,
+                    mimeType: photo.mimeType,
+                    hash: photo.hash
+                });
+            } else {
+                uploadedPhotos.push(photo);
+            }
         }
-
-        const response = await fetch("/api/upload", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                file: currentForm.photoUrl,
-                fileName: currentForm.fileName,
-                mimeType: currentForm.fileMimeType
-            })
-        });
-        const data = await response.json();
-        if (!response.ok || !data.success) throw new Error(data.error || "Failed to upload bill file.");
-        return {
-            photoUrl: data.url,
-            photoPublicId: data.publicId,
-            photoResourceType: data.resourceType as "image" | "raw" | "video"
-        };
+        return uploadedPhotos;
     };
 
     const syncPaymentLedgerEntry = async ({
@@ -489,8 +532,10 @@ export default function BillsPage() {
                 throw new Error(`Bill number ${normalizedBillNumber} already exists. Duplicate bill numbers are not allowed.`);
             }
 
-            const uploaded = await uploadIfNeeded(form);
+            const uploadedPhotos = await uploadPhotosIfNeeded(form.photos || []);
+            const primaryPhoto = uploadedPhotos[0] || {};
             const paymentStatus = form.paymentStatus === "Paid" ? "Paid" : "Unpaid";
+
             const payload: BillItem = {
                 ...(form as BillItem),
                 billNumber: normalizedBillNumber,
@@ -507,9 +552,13 @@ export default function BillsPage() {
                 paidDate: paymentStatus === "Paid" ? String(form.paidDate || "") : "",
                 paidType: paymentStatus === "Paid" ? (form.paidType || "NEFT/IMPS") : "",
                 chequeNumber: paymentStatus === "Paid" && form.paidType === "Cheque" ? String(form.chequeNumber || "") : "",
-                photoUrl: uploaded.photoUrl || "",
-                photoPublicId: uploaded.photoPublicId || "",
-                photoResourceType: uploaded.photoResourceType || "image"
+                photoUrl: primaryPhoto.url || "",
+                photoPublicId: primaryPhoto.publicId || "",
+                photoResourceType: primaryPhoto.resourceType || "image",
+                fileName: primaryPhoto.name || "",
+                fileMimeType: primaryPhoto.mimeType || "",
+                fileHash: primaryPhoto.hash || "",
+                photos: uploadedPhotos
             };
 
             if (editingId) {
@@ -519,11 +568,24 @@ export default function BillsPage() {
                 const inventoryResult = await reconcileInventoryForBillUpdate(activeOrg.orgId, previous, payload, user.uid);
                 if (inventoryResult.error) throw new Error(inventoryResult.error);
 
+                // Resolve companyId based on the new vendorName and details
+                const companyResult = await ensureCompanyProfile(activeOrg.orgId, {
+                    name: payload.vendorName || "Unknown Company",
+                    gst: payload.vendorGst || "",
+                    address: payload.vendorAddress || "",
+                    phoneNumbers: payload.vendorPhone || "",
+                    createdBy: user.uid
+                });
+                if (companyResult.error) throw new Error(companyResult.error);
+                payload.companyId = companyResult.id || "";
+
+                const companyChanged = previous.companyId !== payload.companyId;
                 const prevLedgerType = previous.billType === "Sale" ? "salesLedger" : "purchaseLedger";
                 const nextLedgerType = payload.billType === "Sale" ? "salesLedger" : "purchaseLedger";
-                const ledgerPayload: Partial<CompanyLedgerEntry> = {
+
+                const ledgerPayload: Omit<CompanyLedgerEntry, "id" | "createdAt" | "updatedAt"> = {
                     entryKind: "bill",
-                    billId: previous.id,
+                    billId: previous.id || editingId,
                     billNumber: payload.billNumber,
                     billType: payload.billType,
                     date: payload.date,
@@ -536,27 +598,46 @@ export default function BillsPage() {
                     billImageResourceType: payload.photoResourceType
                 };
 
-                if (previous.companyId && previous.ledgerEntryId) {
-                    if (prevLedgerType === nextLedgerType) {
-                        const ledgerResult = await updateCompanyLedgerEntry(activeOrg.orgId, previous.companyId, nextLedgerType, previous.ledgerEntryId, ledgerPayload);
-                        if (ledgerResult.error) throw new Error(ledgerResult.error);
-                    } else {
-                        const deleteResult = await deleteCompanyLedgerEntry(activeOrg.orgId, previous.companyId, prevLedgerType, previous.ledgerEntryId);
-                        if (deleteResult.error) throw new Error(deleteResult.error);
-                        const addLedger = await addCompanyLedgerEntry(activeOrg.orgId, previous.companyId, nextLedgerType, ledgerPayload as Omit<CompanyLedgerEntry, "id" | "createdAt" | "updatedAt">);
-                        if (addLedger.error) throw new Error(addLedger.error);
-                        payload.ledgerEntryId = addLedger.id || "";
+                if (companyChanged) {
+                    // Delete from old company
+                    if (previous.companyId && previous.ledgerEntryId) {
+                         await deleteCompanyLedgerEntry(activeOrg.orgId, previous.companyId, prevLedgerType, previous.ledgerEntryId);
                     }
-                }
+                    if (previous.companyId && previous.paymentLedgerEntryId) {
+                         await deleteCompanyLedgerEntry(activeOrg.orgId, previous.companyId, prevLedgerType, previous.paymentLedgerEntryId);
+                    }
+                    // Create in new company
+                    const addLedger = await addCompanyLedgerEntry(activeOrg.orgId, payload.companyId, nextLedgerType, ledgerPayload);
+                    if (addLedger.error) throw new Error(addLedger.error);
+                    payload.ledgerEntryId = addLedger.id || "";
 
-                if (previous.companyId) {
                     payload.paymentLedgerEntryId = await syncPaymentLedgerEntry({
-                        companyId: previous.companyId,
+                        companyId: payload.companyId,
                         billId: previous.id || editingId,
-                        bill: payload,
-                        previousBill: previous,
-                        existingEntryId: previous.paymentLedgerEntryId
+                        bill: payload
                     });
+                } else {
+                    // Normal update
+                    if (previous.companyId && previous.ledgerEntryId) {
+                        if (prevLedgerType === nextLedgerType) {
+                            const ledgerResult = await updateCompanyLedgerEntry(activeOrg.orgId, previous.companyId, nextLedgerType, previous.ledgerEntryId, ledgerPayload);
+                            if (ledgerResult.error) throw new Error(ledgerResult.error);
+                        } else {
+                            await deleteCompanyLedgerEntry(activeOrg.orgId, previous.companyId, prevLedgerType, previous.ledgerEntryId);
+                            const addLedger = await addCompanyLedgerEntry(activeOrg.orgId, previous.companyId, nextLedgerType, ledgerPayload);
+                            if (addLedger.error) throw new Error(addLedger.error);
+                            payload.ledgerEntryId = addLedger.id || "";
+                        }
+                    }
+                    if (previous.companyId) {
+                        payload.paymentLedgerEntryId = await syncPaymentLedgerEntry({
+                            companyId: previous.companyId,
+                            billId: previous.id || editingId,
+                            bill: payload,
+                            previousBill: previous,
+                            existingEntryId: previous.paymentLedgerEntryId
+                        });
+                    }
                 }
 
                 const updateResult = await updateBillItem(activeOrg.orgId, editingId, payload);
@@ -706,6 +787,20 @@ export default function BillsPage() {
                                     </select>
                                 </div>
                             </div>
+                            
+                            <div style={{ display: "flex", gap: "12px", alignItems: "flex-end", flexWrap: "wrap", borderTop: "1px solid var(--border-color)", paddingTop: "12px" }}>
+                                <div style={{ minWidth: "140px", flex: 1 }}>
+                                    <label className="section-label">From Date</label>
+                                    <input type="date" className="input-field" value={fromDate} onChange={(e) => setFromDate(e.target.value)} />
+                                </div>
+                                <div style={{ minWidth: "140px", flex: 1 }}>
+                                    <label className="section-label">To Date</label>
+                                    <input type="date" className="input-field" value={toDate} onChange={(e) => setToDate(e.target.value)} />
+                                </div>
+                                {(fromDate || toDate) && (
+                                    <button type="button" className="btn-secondary" onClick={() => { setFromDate(""); setToDate(""); }} style={{ height: "38px" }}>Clear Dates</button>
+                                )}
+                            </div>
                         </div>
                         <div style={{ maxHeight: "72vh", overflowY: "auto" }}>
                             {loading ? <div style={{ padding: "24px" }}>Loading bills...</div> : filtered.length === 0 ? <div style={{ padding: "24px", opacity: 0.7 }}>No bills found.</div> : filtered.map((bill) => (
@@ -736,6 +831,43 @@ export default function BillsPage() {
                                     <h2 className="section-title">{editingId ? form.billNumber || "Update bill" : "Add bill"}</h2>
                                 </div>
                                 <button type="button" className="panel-icon-btn" onClick={closeDetail}><X size={18} /></button>
+                            </div>
+
+                            <div className="bill-section">
+                                <div className="section-header-row">
+                                    <h3 className="bill-section-title">Bill Photos / Files</h3>
+                                    <button type="button" className="btn-secondary" onClick={() => fileRef.current?.click()} disabled={scanning}><Upload size={16} style={{ marginRight: "8px" }} /> {scanning ? "Scanning..." : "Upload Photos / PDFs"}</button>
+                                </div>
+                                <input ref={fileRef} type="file" multiple accept=".png,.jpg,.jpeg,.webp,.pdf,image/png,image/jpeg,image/webp,application/pdf" style={{ display: "none" }} onChange={onFile} />
+                                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(120px, 1fr))", gap: "12px", marginTop: "12px" }}>
+                                    {(form.photos || []).map((photo, index) => (
+                                        <div key={index} style={{ position: "relative", border: "1px solid var(--border-color)", borderRadius: "8px", overflow: "hidden", aspectRatio: "1", background: "var(--hover-bg)" }}>
+                                            {photo.resourceType === "image" ? (
+                                                <img src={photo.url} alt={`Bill photo ${index + 1}`} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                                            ) : (
+                                                <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", padding: "8px", textAlign: "center" }}>
+                                                    <FileText size={24} style={{ marginBottom: "4px" }} />
+                                                    <span style={{ fontSize: "0.75rem", textOverflow: "ellipsis", overflow: "hidden", whiteSpace: "nowrap", width: "100%" }}>{photo.name || "PDF Document"}</span>
+                                                </div>
+                                            )}
+                                            <button
+                                                type="button"
+                                                style={{ position: "absolute", top: "4px", right: "4px", background: "rgba(220,38,38,0.85)", color: "#fff", border: "none", borderRadius: "50%", width: "22px", height: "22px", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}
+                                                onClick={() => {
+                                                    const photos = (form.photos || []).filter((_, i) => i !== index);
+                                                    setForm((current) => ({ ...current, photos }));
+                                                }}
+                                            >
+                                                <X size={12} />
+                                            </button>
+                                        </div>
+                                    ))}
+                                </div>
+                                {(!form.photos || form.photos.length === 0) && (
+                                    <div style={{ padding: "20px", border: "1px dashed var(--border-color)", borderRadius: "8px", textAlign: "center", opacity: 0.7, fontSize: "0.9rem" }}>
+                                        No photos uploaded yet. Select files to upload.
+                                    </div>
+                                )}
                             </div>
 
                             <div className="bill-section">
@@ -775,19 +907,6 @@ export default function BillsPage() {
                             </div>
 
                             <div className="bill-section">
-                                <div className="section-header-row">
-                                    <h3 className="bill-section-title">Bill File</h3>
-                                    {!editingId && <button type="button" className="btn-secondary" onClick={() => fileRef.current?.click()} disabled={scanning}><Upload size={16} style={{ marginRight: "8px" }} /> {scanning ? "Scanning..." : "Upload PNG / JPG / WEBP / PDF"}</button>}
-                                </div>
-                                <input ref={fileRef} type="file" accept=".png,.jpg,.jpeg,.webp,.pdf,image/png,image/jpeg,image/webp,application/pdf" style={{ display: "none" }} onChange={onFile} />
-                                <div className="file-preview-box">
-                                    {previewSrc ? <img src={previewSrc} alt="Bill preview" style={{ maxWidth: "100%", maxHeight: "240px", borderRadius: "12px", objectFit: "contain" }} /> : <div style={{ opacity: 0.7 }}>Upload a supported image or PDF to scan the bill.</div>}
-                                    {previewLabel && <div style={{ marginTop: "10px", opacity: 0.75 }}>{previewLabel}</div>}
-                                    {editingId && <div style={{ marginTop: "10px", opacity: 0.75 }}>Bill file is locked while updating.</div>}
-                                </div>
-                            </div>
-
-                            <div className="bill-section">
                                 <h3 className="bill-section-title">Company Details</h3>
                                 <div className="form-grid-2">
                                     <div ref={companyDropdownRef} style={{ position: "relative" }}>
@@ -800,10 +919,9 @@ export default function BillsPage() {
                                                 setShowCompanySuggestions(true);
                                             }}
                                             onFocus={() => setShowCompanySuggestions(true)}
-                                            disabled={!!editingId}
                                             required
                                         />
-                                        {!editingId && showCompanySuggestions && companySuggestions.length > 0 && (
+                                        {showCompanySuggestions && companySuggestions.length > 0 && (
                                             <div className="suggestion-dropdown">
                                                 {companySuggestions.map((company) => (
                                                     <button key={company.id} type="button" className="suggestion-item" onClick={() => applyCompanySelection(company)}>
@@ -816,17 +934,17 @@ export default function BillsPage() {
                                     </div>
                                     <div>
                                         <label className="section-label">GST</label>
-                                        <input className="input-field" value={form.vendorGst || ""} onChange={(e) => setForm({ ...form, vendorGst: e.target.value })} disabled={!!editingId} />
+                                        <input className="input-field" value={form.vendorGst || ""} onChange={(e) => setForm({ ...form, vendorGst: e.target.value })} />
                                     </div>
                                 </div>
                                 <div className="form-grid-2" style={{ marginTop: "12px" }}>
                                     <div>
                                         <label className="section-label">Phone</label>
-                                        <input className="input-field" value={form.vendorPhone || ""} onChange={(e) => setForm({ ...form, vendorPhone: e.target.value })} disabled={!!editingId} />
+                                        <input className="input-field" value={form.vendorPhone || ""} onChange={(e) => setForm({ ...form, vendorPhone: e.target.value })} />
                                     </div>
                                     <div>
                                         <label className="section-label">Address</label>
-                                        <input className="input-field" value={form.vendorAddress || ""} onChange={(e) => setForm({ ...form, vendorAddress: e.target.value })} disabled={!!editingId} />
+                                        <input className="input-field" value={form.vendorAddress || ""} onChange={(e) => setForm({ ...form, vendorAddress: e.target.value })} />
                                     </div>
                                 </div>
                             </div>
@@ -1021,7 +1139,29 @@ export default function BillsPage() {
                                     <div><span className="detail-label">Type</span><strong>{selected.billType}</strong></div>
                                     <div><span className="detail-label">Date</span><strong>{selected.date}</strong></div>
                                     <div><span className="detail-label">Amount</span><strong>{formatCurrencyINR(selected.amount)}</strong></div>
-                                    <div><span className="detail-label">Bill File</span>{selected.photoPublicId ? <a className="inline-link" href={getBillAssetUrl(selected)} target="_blank" rel="noreferrer">Open file</a> : <strong>Not uploaded</strong>}</div>
+                                    <div>
+                                        <span className="detail-label">Bill Files</span>
+                                        {selected.photos && selected.photos.length > 0 ? (
+                                            <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", marginTop: "4px" }}>
+                                                {selected.photos.map((photo, i) => (
+                                                    <a
+                                                        key={i}
+                                                        className="inline-link"
+                                                        href={photo.url}
+                                                        target="_blank"
+                                                        rel="noreferrer"
+                                                        style={{ display: "inline-flex", alignItems: "center", gap: "4px", padding: "4px 8px", background: "var(--hover-bg)", borderRadius: "6px", fontSize: "0.85rem" }}
+                                                    >
+                                                        <FileText size={14} /> File ${i + 1}
+                                                    </a>
+                                                ))}
+                                            </div>
+                                        ) : selected.photoPublicId ? (
+                                            <a className="inline-link" href={getBillAssetUrl(selected)} target="_blank" rel="noreferrer">Open file</a>
+                                        ) : (
+                                            <strong>Not uploaded</strong>
+                                        )}
+                                    </div>
                                     <div><span className="detail-label">Payment</span><strong>{selected.paymentStatus || "Unpaid"}</strong></div>
                                     <div><span className="detail-label">Paid Date</span><strong>{selected.paidDate || "-"}</strong></div>
                                     <div><span className="detail-label">Paid Type</span><strong>{selected.paidType || "-"}</strong></div>

@@ -26,6 +26,15 @@ export interface BillTaxDetail {
     taxAmount: number | string;
 }
 
+export interface BillPhoto {
+    url: string;
+    publicId: string;
+    resourceType: "image" | "raw" | "video";
+    name?: string;
+    mimeType?: string;
+    hash?: string;
+}
+
 export interface BillItem {
     id?: string;
     billNumber: string;
@@ -55,6 +64,7 @@ export interface BillItem {
     fileName?: string;
     fileMimeType?: string;
     fileHash?: string;
+    photos?: BillPhoto[];
     date: string;
     createdAt?: string;
     createdBy?: string;

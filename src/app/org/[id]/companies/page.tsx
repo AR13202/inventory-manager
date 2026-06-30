@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 import { ArrowLeft, Building2, CreditCard, FileText, Info, MoreVertical, Pencil, Plus, RefreshCw, Search, Trash2, Wallet } from "lucide-react";
 import { useAuth } from "@/context/AuthContext";
 import { useOrg } from "@/context/OrgContext";
@@ -71,6 +72,7 @@ const getFinancialYearLabel = () => {
 };
 
 export default function CompaniesPage() {
+    const router = useRouter();
     const { user } = useAuth();
     const { activeOrg } = useOrg();
     const billAdjustmentDropdownRef = useRef<HTMLDivElement>(null);
@@ -283,7 +285,9 @@ export default function CompaniesPage() {
                 setError("This bill-linked row is orphaned because the bill was deleted. You can delete it from the ledger.");
                 return;
             }
-            setError("Bill-linked ledger rows should be edited from the Bills tab.");
+            if (entry.billId && activeOrg) {
+                router.push(`/org/${activeOrg.orgId}/bills?mode=edit&id=${entry.billId}`);
+            }
             return;
         }
         openLedgerModal("edit", entry);
@@ -480,77 +484,256 @@ export default function CompaniesPage() {
             });
 
             const pdfClosingBalance = runningBalance;
+            const periodDebit = pdfEntries.reduce((sum, entry) => sum + Number(entry.debit || 0), 0);
+            const periodCredit = pdfEntries.reduce((sum, entry) => sum + Number(entry.credit || 0), 0);
+
+            const formatLedgerDate = (dateStr: string) => {
+                if (!dateStr) return "-";
+                const parts = dateStr.split("-");
+                if (parts.length === 3) {
+                    return `${parts[2]}-${parts[1]}-${parts[0]}`;
+                }
+                return dateStr;
+            };
 
             const openingRow = `
                 <tr>
                     <td>${escapeHtml(`01-04-${startYear}`)}</td>
-                    <td colspan="5" style="font-weight: bold;">Opening Balance</td>
-                    <td style="font-weight: bold;">${escapeHtml(formatCurrencyINR(Math.abs(pdfOpeningBalance)))} ${pdfOpeningBalance > 0 ? "Dr" : pdfOpeningBalance < 0 ? "Cr" : ""}</td>
+                    <td>-</td>
+                    <td>-</td>
+                    <td style="font-weight: bold;">Opening Balance</td>
+                    <td class="right"></td>
+                    <td class="right"></td>
+                    <td class="right" style="font-weight: bold;">${escapeHtml(formatCurrencyINR(Math.abs(pdfOpeningBalance)))} ${pdfOpeningBalance > 0 ? "Dr" : pdfOpeningBalance < 0 ? "Cr" : ""}</td>
+                </tr>
+            `;
+
+            const rowsHtml = openingRow + (rows.length > 0 ? rows.map((entry) => {
+                const typeLabel = entry.entryKind === "receipt" || entry.entryKind === "payment"
+                    ? (entry.entryKind === "receipt" ? "Rcpt" : "Paym")
+                    : (entry.source === "Purchase" ? "Purc" : "Sale");
+                
+                const isReceiptOrPayment = entry.entryKind === "receipt" || entry.entryKind === "payment";
+                const vchNo = isReceiptOrPayment ? "" : (entry.billNumber || "-");
+
+                let particulars = "-";
+                if (entry.entryKind === "receipt" || entry.entryKind === "payment") {
+                    particulars = "";
+                } else if (entry.source === "Purchase") {
+                    particulars = "Dr Purchase";
+                } else if (entry.source === "Sale") {
+                    particulars = "Cr Sales";
+                }
+
+                const debitVal = entry.debit ? formatCurrencyINR(Number(entry.debit)) : "";
+                const creditVal = entry.credit ? formatCurrencyINR(Number(entry.credit)) : "";
+                const runningBalanceVal = `${formatCurrencyINR(Math.abs(entry.runningBalance))} ${entry.runningBalance > 0 ? "Dr" : entry.runningBalance < 0 ? "Cr" : ""}`;
+
+                return `
+                    <tr>
+                        <td>${escapeHtml(formatLedgerDate(entry.date || ""))}</td>
+                        <td>${escapeHtml(typeLabel)}</td>
+                        <td>${escapeHtml(vchNo)}</td>
+                        <td>${escapeHtml(particulars)}</td>
+                        <td class="right">${escapeHtml(debitVal)}</td>
+                        <td class="right">${escapeHtml(creditVal)}</td>
+                        <td class="right">${escapeHtml(runningBalanceVal)}</td>
+                    </tr>
+                `;
+            }).join("") : `<tr><td colspan="7" style="text-align:center;">No entries in this period.</td></tr>`);
+
+            // Double-entry balancing calculations
+            const totalDebitCol = (pdfOpeningBalance > 0 ? pdfOpeningBalance : 0) + periodDebit;
+            const totalCreditCol = (pdfOpeningBalance < 0 ? Math.abs(pdfOpeningBalance) : 0) + periodCredit;
+            const closingBalanceVal = totalDebitCol - totalCreditCol;
+
+            const totalRow = `
+                <tr class="total-row">
+                    <td></td>
+                    <td></td>
+                    <td></td>
+                    <td>Total</td>
+                    <td class="right">${escapeHtml(formatCurrencyINR(totalDebitCol))}</td>
+                    <td class="right">${escapeHtml(formatCurrencyINR(totalCreditCol))}</td>
                     <td></td>
                 </tr>
             `;
 
-            const closingRow = `
-                <tr style="border-top: 2px solid #000;">
-                    <td>${escapeHtml(`31-03-${endYear + 1}`)}</td>
-                    <td colspan="5" style="font-weight: bold;">Closing Balance</td>
-                    <td style="font-weight: bold;">${escapeHtml(formatCurrencyINR(Math.abs(pdfClosingBalance)))} ${pdfClosingBalance > 0 ? "Dr" : pdfClosingBalance < 0 ? "Cr" : ""}</td>
+            let balanceRow = "";
+            let grandTotalDebit = totalDebitCol;
+            let grandTotalCredit = totalCreditCol;
+
+            if (closingBalanceVal > 0) {
+                // Net Debit balance - goes to Credit side to balance the ledger
+                balanceRow = `
+                    <tr class="balance-row">
+                        <td></td>
+                        <td></td>
+                        <td></td>
+                        <td>Debit Balance</td>
+                        <td class="right"></td>
+                        <td class="right">${escapeHtml(formatCurrencyINR(closingBalanceVal))}</td>
+                        <td></td>
+                    </tr>
+                `;
+                grandTotalCredit = totalCreditCol + closingBalanceVal;
+            } else if (closingBalanceVal < 0) {
+                // Net Credit balance - goes to Debit side to balance the ledger
+                const absBal = Math.abs(closingBalanceVal);
+                balanceRow = `
+                    <tr class="balance-row">
+                        <td></td>
+                        <td></td>
+                        <td></td>
+                        <td>Credit Balance</td>
+                        <td class="right">${escapeHtml(formatCurrencyINR(absBal))}</td>
+                        <td class="right"></td>
+                        <td></td>
+                    </tr>
+                `;
+                grandTotalDebit = totalDebitCol + absBal;
+            } else {
+                // Balance is zero - display Closing Balance as 0.00
+                balanceRow = `
+                    <tr class="balance-row">
+                        <td></td>
+                        <td></td>
+                        <td></td>
+                        <td>Closing Balance</td>
+                        <td class="right"></td>
+                        <td class="right">${escapeHtml(formatCurrencyINR(0))}</td>
+                        <td></td>
+                    </tr>
+                `;
+            }
+
+            const grandTotalRow = `
+                <tr class="grand-total-row">
+                    <td></td>
+                    <td></td>
+                    <td></td>
+                    <td>Grand Total</td>
+                    <td class="right">${escapeHtml(formatCurrencyINR(grandTotalDebit))}</td>
+                    <td class="right">${escapeHtml(formatCurrencyINR(grandTotalCredit))}</td>
                     <td></td>
                 </tr>
             `;
 
-            const rowsHtml = openingRow + (rows.length > 0 ? rows.map((entry) => `
-                <tr>
-                    <td>${escapeHtml(entry.date || "-")}</td>
-                    <td>${escapeHtml(getEntryTypeLabel(entry))}</td>
-                    <td>${escapeHtml(entry.billNumber || "-")}</td>
-                    <td>${escapeHtml(entry.gateway || "-")}</td>
-                    <td>${escapeHtml(formatCurrencyINR(Number(entry.debit || 0)))}</td>
-                    <td>${escapeHtml(formatCurrencyINR(Number(entry.credit || 0)))}</td>
-                    <td>${escapeHtml(formatCurrencyINR(Math.abs(entry.runningBalance)))} ${entry.runningBalance > 0 ? "Dr" : entry.runningBalance < 0 ? "Cr" : ""}</td>
-                    <td>${escapeHtml(entry.note || "-")}</td>
-                </tr>
-            `).join("") : `<tr><td colspan="8" style="text-align:center;">No entries in this period.</td></tr>`) + closingRow;
+            const footerHtml = totalRow + balanceRow + grandTotalRow;
 
             openPrintWindow(
                 `${selectedCompany.name} Ledger`,
                 `
-                    <h1>${escapeHtml(selectedCompany.name)} Ledger</h1>
-                    <p class="meta">Generated on ${escapeHtml(new Date().toLocaleString("en-IN"))}</p>
-                    <div class="grid">
-                        <div class="card">
-                            <div class="label">GST</div>
-                            <div class="value" style="font-size:16px;">${escapeHtml(selectedCompany.gst || "-")}</div>
+                    <style>
+                      @media print {
+                        @page {
+                          size: portrait;
+                          margin: 15mm 10mm;
+                        }
+                        body {
+                          padding: 0;
+                          background: #ffffff;
+                          color: #000000;
+                        }
+                      }
+                      body {
+                        font-family: "Arial", sans-serif;
+                        background: #ffffff;
+                        color: #000000;
+                        margin: 0;
+                        padding: 10px;
+                      }
+                      .report-table {
+                        width: 100%;
+                        border-collapse: collapse;
+                        margin-top: 24px;
+                        font-size: 11px;
+                        color: #000000;
+                      }
+                      .report-table th {
+                        border-top: 1.5px solid #000000;
+                        border-bottom: 1.5px solid #000000;
+                        padding: 6px 4px;
+                        font-weight: bold;
+                        text-align: left;
+                        color: #000000;
+                        text-transform: none;
+                        font-size: 11px;
+                        letter-spacing: normal;
+                        background: transparent;
+                      }
+                      .report-table td {
+                        padding: 6px 4px;
+                        border: none;
+                        color: #000000;
+                        vertical-align: top;
+                      }
+                      .report-table td.right, .report-table th.right {
+                        text-align: right;
+                      }
+                      .report-table tr.total-row td {
+                        border-top: 1px solid #000000;
+                        font-weight: normal;
+                        padding-top: 8px;
+                      }
+                      .report-table tr.balance-row td {
+                        font-weight: bold;
+                        padding: 6px 4px;
+                      }
+                      .report-table tr.grand-total-row td {
+                        border-top: 1px solid #000000;
+                        border-bottom: 3px double #000000;
+                        font-weight: normal;
+                        padding-top: 6px;
+                        padding-bottom: 6px;
+                      }
+                    </style>
+
+                    <div style="text-align: center; color: #000000; font-family: Arial, sans-serif; position: relative;">
+                      ${activeOrg && activeOrg.logoPublicId ? `
+                        <div style="position: absolute; left: 0; top: 0;">
+                          <img
+                            src="${window.location.origin}/api/bills/file?publicId=${encodeURIComponent(activeOrg.logoPublicId)}&resourceType=${encodeURIComponent(activeOrg.logoResourceType || 'image')}"
+                            alt="Logo"
+                            style="width: 60px; height: 60px; object-fit: cover; border-radius: 8px; border: 1px solid #cbd5e1;"
+                          />
                         </div>
-                        <div class="card">
-                            <div class="label">Total Debit</div>
-                            <div class="value">${escapeHtml(formatCurrencyINR(totalDebit))}</div>
-                        </div>
-                        <div class="card">
-                            <div class="label">Total Credit</div>
-                            <div class="value">${escapeHtml(formatCurrencyINR(totalCredit))}</div>
-                        </div>
+                      ` : ""}
+                      <div style="font-size: 22px; font-weight: bold; text-transform: uppercase; letter-spacing: 1px;">
+                        ${escapeHtml(activeOrg?.name || "")}
+                      </div>
+                      ${activeOrg?.address ? `<div style="font-size: 11px; margin-top: 4px;">${escapeHtml(activeOrg.address)}</div>` : ""}
+                      ${activeOrg?.gst ? `<div style="font-size: 11px; margin-top: 2px;">GSTIN : ${escapeHtml(activeOrg.gst)}</div>` : ""}
+                      
+                      <div style="font-size: 16px; font-weight: bold; margin-top: 14px; text-transform: uppercase; letter-spacing: 2px; border-top: 1px solid #000000; border-bottom: 1px solid #000000; padding: 4px 0;">
+                        L E D G E R
+                      </div>
+                      <div style="font-size: 12px; margin-top: 6px; font-style: italic;">
+                        ( From ${escapeHtml(formatLedgerDate(fyStartDateStr))} to ${escapeHtml(`31-03-${endYear + 1}`)} )
+                      </div>
+                      <div style="font-size: 14px; font-weight: bold; margin-top: 8px;">
+                        Account : ${escapeHtml(selectedCompany.name || "")}
+                      </div>
+                      ${selectedCompany.gst ? `<div style="font-size: 12px; margin-top: 2px; font-weight: bold;">GSTIN : ${escapeHtml(selectedCompany.gst)}</div>` : ""}
                     </div>
-                    <div class="section">
-                        <h2>Ledger Entries</h2>
-                        <table>
-                            <thead>
-                                <tr>
-                                    <th>Date</th>
-                                    <th>Type</th>
-                                    <th>Bill Number</th>
-                                    <th>Mode</th>
-                                    <th>Debit</th>
-                                    <th>Credit</th>
-                                    <th>Balance</th>
-                                    <th>Remarks</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                ${rowsHtml || '<tr><td colspan="8">No entries found.</td></tr>'}
-                            </tbody>
-                        </table>
-                    </div>
+
+                    <table class="report-table">
+                        <thead>
+                            <tr>
+                                <th>Date</th>
+                                <th>Type</th>
+                                <th>Vch No.</th>
+                                <th>Particulars</th>
+                                <th class="right">Debit (₹)</th>
+                                <th class="right">Credit (₹)</th>
+                                <th class="right">Balance (₹)</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${rowsHtml}
+                            ${footerHtml}
+                        </tbody>
+                    </table>
                 `
             );
         } catch (err: any) {
@@ -583,7 +766,7 @@ export default function CompaniesPage() {
                                 value={sortOption} 
                                 onChange={(e) => setSortOption(e.target.value as "name-asc" | "name-desc" | "balance-asc" | "balance-desc")}
                                 className="panel-icon-btn"
-                                style={{ flex: 1, padding: "0 10px", fontSize: "13px", height: "38px", border: "1px solid var(--border-color)", borderRadius: "8px", background: "var(--card-bg)" }}
+                                style={{ flex: 1, padding: "0 10px", fontSize: "13px", height: "38px", border: "1px solid var(--border-color)", borderRadius: "8px", background: "var(--surface-color)", color: "var(--text-color)" }}
                             >
                                 <option value="name-asc">Name (A-Z)</option>
                                 <option value="name-desc">Name (Z-A)</option>

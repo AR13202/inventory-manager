@@ -33,8 +33,7 @@ html[data-theme="dark"] {
   --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.3);
   --shadow-md: 0 10px 24px -10px rgba(0, 0, 0, 0.45);
 }
-
-* {
+* {
   box-sizing: border-box;
   margin: 0;
   padding: 0;
@@ -50,16 +49,6 @@ body {
   transition: var(--transition);
 }
 
-h1,
-h2,
-h3,
-h4,
-h5,
-h6 {
-  font-weight: 600;
-  line-height: 1.2;
-}
-
 a {
   color: inherit;
   text-decoration: none;
@@ -70,6 +59,7 @@ button {
   border: none;
   cursor: pointer;
   font-family: inherit;
+  color: inherit;
 }
 
 /* Utilities */
@@ -257,6 +247,7 @@ button {
   border-bottom: 1px solid var(--border-color);
   text-align: left;
   transition: var(--transition);
+  color: var(--text-color);
 }
 
 .workspace-list-row.active,
@@ -550,9 +541,14 @@ button {
 .outstanding-monthly-card {
   padding: 18px;
   border-radius: 20px;
-  background: rgba(255, 255, 255, 0.68);
-  border: 1px solid rgba(148, 163, 184, 0.18);
+  background: var(--glass-bg);
+  border: 1px solid var(--border-color);
   margin-top: 20px;
+}
+
+.input-field option {
+  background: var(--surface-color);
+  color: var(--text-color);
 }
 
 .outstanding-table-wrap {

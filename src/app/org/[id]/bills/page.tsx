@@ -2,10 +2,10 @@
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
-import { ArrowLeft, Edit, FileText, Filter, Plus, Search, Trash2, Upload, X } from "lucide-react";
+import { ArrowLeft, Edit, FileText, Filter, Plus, Search, Sparkles, Trash2, Upload, X } from "lucide-react";
 import { useAuth } from "@/context/AuthContext";
 import { useOrg } from "@/context/OrgContext";
-import { addBillItem, BillItem, deleteBillItem, subscribeToBills, updateBillItem } from "@/utils/firebaseHelpers/bills";
+import { addBillItem, BillItem, BillTaxDetail, deleteBillItem, subscribeToBills, updateBillItem } from "@/utils/firebaseHelpers/bills";
 import {
     addCompanyLedgerEntry,
     Company,
@@ -20,6 +20,7 @@ import { InventoryItem, reconcileInventoryForBillUpdate, subscribeToInventory, s
 import { createBillNumber, getBillAssetUrl, normalizeBillType, sanitizeBillNumber } from "@/utils/billHelpers";
 import { formatCurrencyINR } from "@/utils/formatters";
 import { scanReceipt } from "@/utils/geminiScanner";
+import { compressImageForUpload } from "@/utils/imageCompressor";
 
 type FormState = Partial<BillItem> & { vendorGst?: string; vendorAddress?: string; vendorPhone?: string };
 type BillFilter = "All" | "Purchase" | "Sale";
@@ -95,11 +96,34 @@ const emptyForm = (): FormState => ({
     photos: []
 });
 
-const recalc = (form: FormState) => {
+const DEFAULT_TAX_RATES: Record<string, string> = {
+    "CGST": "9",
+    "SGST": "9",
+    "IGST": "18",
+    "UTGST": "9",
+    "Tax": "18"
+};
+
+const calculateAutoRoundOff = (grossAmount: number, taxAmount: number, freightValue: string | number | undefined) => {
+    const rawSubtotal = grossAmount + taxAmount + parseNumericValue(freightValue);
+    const rounded = Math.round(rawSubtotal);
+    const diff = Number((rounded - rawSubtotal).toFixed(2));
+    return diff === 0 ? "0" : String(diff);
+};
+
+const recalc = (form: FormState, options: { autoRoundOff?: boolean } = {}) => {
     const grossAmount = (form.products || []).reduce((s, p) => s + parseNumericValue(p.quantity) * parseNumericValue(p.price), 0);
     const taxAmount = (form.taxDetails || []).reduce((s, t) => s + parseNumericValue(t.taxAmount), 0);
-    const amount = grossAmount + taxAmount + parseNumericValue(form.freightAndForwardingCharges) + parseNumericValue(form.roundOff);
-    return { grossAmount, taxAmount, amount };
+    const freight = parseNumericValue(form.freightAndForwardingCharges);
+    
+    let roundOff = form.roundOff;
+    if (options.autoRoundOff) {
+        roundOff = calculateAutoRoundOff(grossAmount, taxAmount, form.freightAndForwardingCharges);
+    }
+    
+    const roundOffVal = parseNumericValue(roundOff);
+    const amount = Number((grossAmount + taxAmount + freight + roundOffVal).toFixed(2));
+    return { grossAmount, taxAmount, roundOff, amount };
 };
 
 const readDataUrl = (file: File) => new Promise<string>((resolve, reject) => {
@@ -143,6 +167,7 @@ export default function BillsPage() {
     const [error, setError] = useState("");
     const [busy, setBusy] = useState(false);
     const [scanning, setScanning] = useState(false);
+    const [scanProgress, setScanProgress] = useState("");
     const [showCompanySuggestions, setShowCompanySuggestions] = useState(false);
 
     useEffect(() => {
@@ -304,13 +329,127 @@ export default function BillsPage() {
                 products[index].category = found.category || "Trade";
             }
         }
-        setForm((current) => ({ ...current, products, ...recalc({ ...current, products }) }));
+        
+        // Re-calculate tax amounts automatically based on new gross amount
+        const newGross = products.reduce((s, p) => s + parseNumericValue(p.quantity) * parseNumericValue(p.price), 0);
+        const updatedTaxDetails = (form.taxDetails || []).map((t) => {
+            const pct = parseNumericValue(t.taxPercentage);
+            if (pct > 0) {
+                return {
+                    ...t,
+                    taxAmount: toFormNumber(Number(((newGross * pct) / 100).toFixed(2)))
+                };
+            }
+            return t;
+        });
+
+        setForm((current) => {
+            const updated = { ...current, products, taxDetails: updatedTaxDetails };
+            return { ...updated, ...recalc(updated, { autoRoundOff: true }) };
+        });
     };
 
-    const setTax = (index: number, key: string, value: string) => {
+    const setTaxType = (index: number, taxType: string) => {
         const taxDetails = [...(form.taxDetails || [])];
-        taxDetails[index] = { ...taxDetails[index], [key]: value };
-        setForm((current) => ({ ...current, taxDetails, ...recalc({ ...current, taxDetails }) }));
+        const defaultRate = DEFAULT_TAX_RATES[taxType] !== undefined ? DEFAULT_TAX_RATES[taxType] : (taxDetails[index]?.taxPercentage || "9");
+        const gross = (form.products || []).reduce((s, p) => s + parseNumericValue(p.quantity) * parseNumericValue(p.price), 0);
+        const pctVal = parseNumericValue(defaultRate);
+        const calcAmount = gross > 0 && pctVal > 0 ? toFormNumber(Number(((gross * pctVal) / 100).toFixed(2))) : toFormNumber(taxDetails[index]?.taxAmount);
+
+        taxDetails[index] = {
+            ...taxDetails[index],
+            taxType,
+            taxPercentage: defaultRate,
+            taxAmount: calcAmount
+        };
+
+        setForm((current) => {
+            const updated = { ...current, taxDetails };
+            return { ...updated, ...recalc(updated, { autoRoundOff: true }) };
+        });
+    };
+
+    const setTaxPercentage = (index: number, taxPercentage: string) => {
+        if (!isValidNumericInput(taxPercentage)) return;
+        const taxDetails = [...(form.taxDetails || [])];
+        const gross = (form.products || []).reduce((s, p) => s + parseNumericValue(p.quantity) * parseNumericValue(p.price), 0);
+        const pctVal = parseNumericValue(taxPercentage);
+        const calcAmount = gross > 0 && pctVal > 0 ? toFormNumber(Number(((gross * pctVal) / 100).toFixed(2))) : (taxPercentage === "" ? "0" : toFormNumber(taxDetails[index]?.taxAmount));
+
+        taxDetails[index] = {
+            ...taxDetails[index],
+            taxPercentage,
+            taxAmount: calcAmount
+        };
+
+        setForm((current) => {
+            const updated = { ...current, taxDetails };
+            return { ...updated, ...recalc(updated, { autoRoundOff: true }) };
+        });
+    };
+
+    const setTaxAmount = (index: number, taxAmount: string) => {
+        if (!isValidNumericInput(taxAmount)) return;
+        const taxDetails = [...(form.taxDetails || [])];
+        taxDetails[index] = {
+            ...taxDetails[index],
+            taxAmount
+        };
+
+        setForm((current) => {
+            const updated = { ...current, taxDetails };
+            return { ...updated, ...recalc(updated, { autoRoundOff: true }) };
+        });
+    };
+
+    const addTaxRow = () => {
+        const currentTaxes = form.taxDetails || [];
+        let nextType = "CGST";
+        let nextRate = "9";
+        const hasCGST = currentTaxes.some((t) => t.taxType === "CGST");
+        const hasSGST = currentTaxes.some((t) => t.taxType === "SGST");
+        if (hasCGST && !hasSGST) {
+            nextType = "SGST";
+            nextRate = "9";
+        } else if (hasCGST && hasSGST) {
+            nextType = "IGST";
+            nextRate = "18";
+        }
+
+        const gross = (form.products || []).reduce((s, p) => s + parseNumericValue(p.quantity) * parseNumericValue(p.price), 0);
+        const pctVal = parseNumericValue(nextRate);
+        const calcAmount = gross > 0 && pctVal > 0 ? toFormNumber(Number(((gross * pctVal) / 100).toFixed(2))) : "0";
+
+        const newRow: BillTaxDetail = {
+            taxType: nextType,
+            taxPercentage: nextRate,
+            taxAmount: calcAmount
+        };
+
+        const taxDetails = [...currentTaxes, newRow];
+        setForm((current) => {
+            const updated = { ...current, taxDetails };
+            return { ...updated, ...recalc(updated, { autoRoundOff: true }) };
+        });
+    };
+
+    const removeTax = (index: number) => {
+        const taxDetails = (form.taxDetails || []).filter((_, row) => row !== index);
+        setForm((current) => {
+            const updated = { ...current, taxDetails };
+            return { ...updated, ...recalc(updated, { autoRoundOff: true }) };
+        });
+    };
+
+    const applyAutoRoundOff = () => {
+        setForm((current) => {
+            const gross = (current.products || []).reduce((s, p) => s + parseNumericValue(p.quantity) * parseNumericValue(p.price), 0);
+            const tax = (current.taxDetails || []).reduce((s, t) => s + parseNumericValue(t.taxAmount), 0);
+            const freight = parseNumericValue(current.freightAndForwardingCharges);
+            const autoRound = calculateAutoRoundOff(gross, tax, freight);
+            const updated = { ...current, roundOff: autoRound };
+            return { ...updated, ...recalc(updated, { autoRoundOff: false }) };
+        });
     };
 
     const applyCompanySelection = (company: Company) => {
@@ -328,19 +467,18 @@ export default function BillsPage() {
         if (!isValidNumericInput(value, allowNegative)) return;
         setForm((current) => {
             const next = { ...current, [field]: value };
-            return { ...next, ...recalc(next) };
+            const isRoundOffManual = field === "roundOff";
+            return { ...next, ...recalc(next, { autoRoundOff: !isRoundOffManual }) };
         });
     };
 
     const onFile = async (event: React.ChangeEvent<HTMLInputElement>) => {
         const files = event.target.files;
         if (!files || files.length === 0) return;
-        setScanning(true);
         setError("");
 
         try {
             const newPhotos = [...(form.photos || [])];
-            let autoFilled = false;
 
             for (let i = 0; i < files.length; i++) {
                 const file = files[i];
@@ -363,59 +501,80 @@ export default function BillsPage() {
                 };
 
                 newPhotos.push(photoObj);
-
-                // Scan the first new photo to auto-fill details if not scanned already and not editing
-                if (!autoFilled && !editingId) {
-                    const parsed = await scanReceipt(fileDataUrl);
-                    const billType = parsed.billType === "Unknown" ? normalizeBillType(form.billType) : normalizeBillType(parsed.billType);
-                    const company = billType === "Purchase" ? parsed.parentCompanyDetails : parsed.customerCompanyDetails;
-                    const parsedItems = parsed.items || [];
-                    const products = parsedItems.length > 0 ? parsedItems.map((item) => {
-                        const found = inventory.find((inv) => inv.name.toLowerCase() === String(item.name || "").toLowerCase());
-                        return {
-                            name: item.name || "",
-                            quantity: toFormNumber(item.quantity || 1),
-                            unit: item.unit || found?.unit || "",
-                            price: toFormNumber(item.price || 0),
-                            hsn: item.hsn || found?.hsn || "",
-                            category: item.category || found?.category || "Trade"
-                        };
-                    }) : form.products || [];
-
-                    setForm((current) => ({
-                        ...current,
-                        billNumber: sanitizeBillNumber(parsed.billNumber) || current.billNumber,
-                        vendorName: company?.name || current.vendorName,
-                        vendorGst: company?.gst || "",
-                        vendorAddress: company?.address || "",
-                        vendorPhone: company?.phoneNumbers || "",
-                        billType,
-                        date: parsed.date || current.date,
-                        products,
-                        taxDetails: (parsed.taxDetails || []).map((tax) => ({
-                            taxType: tax.taxType || "Tax",
-                            taxPercentage: toFormNumber(tax.taxPercentage || 0),
-                            taxAmount: toFormNumber(tax.taxAmount || 0)
-                        })),
-                        freightAndForwardingCharges: toFormNumber(parsed.freightAndForwardingCharges || 0),
-                        roundOff: toFormNumber(parsed.roundOff || 0),
-                        isScanned: true
-                    }));
-
-                    setParsedCompanies({ parent: parsed.parentCompanyDetails, customer: parsed.customerCompanyDetails });
-                    autoFilled = true;
-                }
             }
 
             setForm((current) => {
                 const next = { ...current, photos: newPhotos };
                 return { ...next, ...recalc(next) };
             });
+        } catch (fileErr: any) {
+            setError(fileErr.message || "Failed to load files.");
+        } finally {
+            if (event.target) event.target.value = "";
+        }
+    };
+
+    const handleScanAllPages = async () => {
+        const photos = form.photos || [];
+        if (photos.length === 0) {
+            setError("Please upload at least one bill photo/page to scan.");
+            return;
+        }
+
+        setScanning(true);
+        setScanProgress(photos.length > 1 ? `Starting multi-page scan (${photos.length} pages)...` : "Preparing image...");
+        setError("");
+
+        try {
+            const urls = photos.map((p) => p.url);
+            const parsed = await scanReceipt(urls, (phase) => {
+                setScanProgress(phase);
+            });
+
+            const billType = parsed.billType === "Unknown" ? normalizeBillType(form.billType) : normalizeBillType(parsed.billType);
+            const company = billType === "Purchase" ? parsed.parentCompanyDetails : parsed.customerCompanyDetails;
+            const parsedItems = parsed.items || [];
+            const products = parsedItems.length > 0 ? parsedItems.map((item) => {
+                const found = inventory.find((inv) => inv.name.toLowerCase() === String(item.name || "").toLowerCase());
+                return {
+                    name: item.name || "",
+                    quantity: toFormNumber(item.quantity || 1),
+                    unit: item.unit || found?.unit || "",
+                    price: toFormNumber(item.price || 0),
+                    hsn: item.hsn || found?.hsn || "",
+                    category: item.category || found?.category || "Trade"
+                };
+            }) : form.products || [];
+
+            setForm((current) => {
+                const next = {
+                    ...current,
+                    billNumber: sanitizeBillNumber(parsed.billNumber) || current.billNumber,
+                    vendorName: company?.name || current.vendorName,
+                    vendorGst: company?.gst || "",
+                    vendorAddress: company?.address || "",
+                    vendorPhone: company?.phoneNumbers || "",
+                    billType,
+                    date: parsed.date || current.date,
+                    products,
+                    taxDetails: (parsed.taxDetails || []).map((tax) => ({
+                        taxType: tax.taxType || "Tax",
+                        taxPercentage: toFormNumber(tax.taxPercentage || 0),
+                        taxAmount: toFormNumber(tax.taxAmount || 0)
+                    })),
+                    freightAndForwardingCharges: toFormNumber(parsed.freightAndForwardingCharges || 0),
+                    roundOff: toFormNumber(parsed.roundOff || 0),
+                    isScanned: true
+                };
+                return { ...next, ...recalc(next) };
+            });
+
+            setParsedCompanies({ parent: parsed.parentCompanyDetails, customer: parsed.customerCompanyDetails });
         } catch (scanError: any) {
-            setError(scanError.message || "Failed to scan file.");
+            setError(scanError.message || "Failed to scan bill pages.");
         } finally {
             setScanning(false);
-            if (event.target) event.target.value = "";
+            setScanProgress("");
         }
     };
 
@@ -423,11 +582,14 @@ export default function BillsPage() {
         const uploadedPhotos = [];
         for (const photo of photos) {
             if (photo.url && photo.url.startsWith("data:")) {
+                // Compress image before uploading to reduce network payload and Cloudinary storage
+                const compressedFile = await compressImageForUpload(photo.url);
+
                 const response = await fetch("/api/upload", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({
-                        file: photo.url,
+                        file: compressedFile,
                         fileName: photo.name,
                         mimeType: photo.mimeType
                     })
@@ -834,25 +996,58 @@ export default function BillsPage() {
                             </div>
 
                             <div className="bill-section">
-                                <div className="section-header-row">
-                                    <h3 className="bill-section-title">Bill Photos / Files</h3>
-                                    <button type="button" className="btn-secondary" onClick={() => fileRef.current?.click()} disabled={scanning}><Upload size={16} style={{ marginRight: "8px" }} /> {scanning ? "Scanning..." : "Upload Photos / PDFs"}</button>
+                                <div className="section-header-row" style={{ flexWrap: "wrap", gap: "10px" }}>
+                                    <div>
+                                        <h3 className="bill-section-title">Bill Photos / Pages</h3>
+                                        <p style={{ fontSize: "0.8rem", color: "var(--text-muted)", marginTop: "2px" }}>
+                                            Attach 1 or more pages for multi-page invoices, then click Scan.
+                                        </p>
+                                    </div>
+                                    <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+                                        <button type="button" className="btn-secondary" onClick={() => fileRef.current?.click()} disabled={scanning}>
+                                            <Upload size={16} style={{ marginRight: "6px" }} /> {form.photos && form.photos.length > 0 ? "Add More Pages" : "Upload Photos / PDFs"}
+                                        </button>
+                                        {form.photos && form.photos.length > 0 && (
+                                            <button
+                                                type="button"
+                                                className="btn-primary"
+                                                style={{ display: "inline-flex", alignItems: "center", gap: "6px", background: "linear-gradient(135deg, #2563eb, #7c3aed)", color: "#fff", fontWeight: 600 }}
+                                                onClick={handleScanAllPages}
+                                                disabled={scanning}
+                                            >
+                                                <Sparkles size={16} />
+                                                {scanning
+                                                    ? (scanProgress || "Scanning Pages...")
+                                                    : `Scan & Auto-Fill (${form.photos.length} ${form.photos.length === 1 ? "Page" : "Pages"})`}
+                                            </button>
+                                        )}
+                                    </div>
                                 </div>
+                                {scanning && (
+                                    <div style={{ marginTop: "12px", padding: "10px 14px", background: "rgba(37, 99, 235, 0.12)", border: "1px solid rgba(37, 99, 235, 0.3)", borderRadius: "8px", fontSize: "0.875rem", color: "var(--primary-color)", display: "flex", alignItems: "center", gap: "10px" }}>
+                                        <div className="spinner-small" style={{ width: "16px", height: "16px", border: "2px solid var(--primary-color)", borderTopColor: "transparent", borderRadius: "50%", animation: "spin 0.8s linear infinite", flexShrink: 0 }} />
+                                        <span style={{ fontWeight: 500 }}>{scanProgress || "Processing multi-page invoice..."}</span>
+                                    </div>
+                                )}
                                 <input ref={fileRef} type="file" multiple accept=".png,.jpg,.jpeg,.webp,.pdf,image/png,image/jpeg,image/webp,application/pdf" style={{ display: "none" }} onChange={onFile} />
-                                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(120px, 1fr))", gap: "12px", marginTop: "12px" }}>
+                                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(130px, 1fr))", gap: "12px", marginTop: "14px" }}>
                                     {(form.photos || []).map((photo, index) => (
                                         <div key={index} style={{ position: "relative", border: "1px solid var(--border-color)", borderRadius: "8px", overflow: "hidden", aspectRatio: "1", background: "var(--hover-bg)" }}>
+                                            <span style={{ position: "absolute", top: "6px", left: "6px", zIndex: 2, background: "rgba(15, 23, 42, 0.85)", color: "#fff", padding: "2px 7px", borderRadius: "4px", fontSize: "0.7rem", fontWeight: 700, backdropFilter: "blur(4px)", border: "1px solid rgba(255,255,255,0.2)" }}>
+                                                Page {index + 1}
+                                            </span>
                                             {photo.resourceType === "image" ? (
-                                                <img src={photo.url} alt={`Bill photo ${index + 1}`} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                                                <img src={photo.url} alt={`Bill page ${index + 1}`} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
                                             ) : (
                                                 <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", padding: "8px", textAlign: "center" }}>
-                                                    <FileText size={24} style={{ marginBottom: "4px" }} />
-                                                    <span style={{ fontSize: "0.75rem", textOverflow: "ellipsis", overflow: "hidden", whiteSpace: "nowrap", width: "100%" }}>{photo.name || "PDF Document"}</span>
+                                                    <FileText size={26} style={{ marginBottom: "4px", color: "var(--primary-color)" }} />
+                                                    <span style={{ fontSize: "0.75rem", textOverflow: "ellipsis", overflow: "hidden", whiteSpace: "nowrap", width: "100%", fontWeight: 500 }}>{photo.name || "PDF Document"}</span>
                                                 </div>
                                             )}
                                             <button
                                                 type="button"
-                                                style={{ position: "absolute", top: "4px", right: "4px", background: "rgba(220,38,38,0.85)", color: "#fff", border: "none", borderRadius: "50%", width: "22px", height: "22px", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}
+                                                title="Remove page"
+                                                style={{ position: "absolute", top: "6px", right: "6px", zIndex: 2, background: "rgba(220,38,38,0.9)", color: "#fff", border: "none", borderRadius: "50%", width: "22px", height: "22px", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", transition: "transform 0.15s" }}
                                                 onClick={() => {
                                                     const photos = (form.photos || []).filter((_, i) => i !== index);
                                                     setForm((current) => ({ ...current, photos }));
@@ -864,8 +1059,8 @@ export default function BillsPage() {
                                     ))}
                                 </div>
                                 {(!form.photos || form.photos.length === 0) && (
-                                    <div style={{ padding: "20px", border: "1px dashed var(--border-color)", borderRadius: "8px", textAlign: "center", opacity: 0.7, fontSize: "0.9rem" }}>
-                                        No photos uploaded yet. Select files to upload.
+                                    <div style={{ padding: "24px", border: "1px dashed var(--border-color)", borderRadius: "8px", textAlign: "center", opacity: 0.75, fontSize: "0.9rem", marginTop: "8px" }}>
+                                        No pages attached yet. Click <strong>Upload Photos / PDFs</strong> to select multiple pages or images.
                                     </div>
                                 )}
                             </div>
@@ -998,7 +1193,19 @@ export default function BillsPage() {
                             <div className="bill-section">
                                 <div className="section-header-row">
                                     <h3 className="bill-section-title">Products</h3>
-                                    <button type="button" className="btn-secondary" onClick={() => setForm({ ...form, products: [...(form.products || []), { name: "", quantity: "", unit: "", price: "", hsn: "", category: "Trade" }] })}>Add Row</button>
+                                    <button
+                                        type="button"
+                                        className="btn-secondary"
+                                        onClick={() => {
+                                            const products = [...(form.products || []), { name: "", quantity: "", unit: "", price: "", hsn: "", category: "Trade" }];
+                                            setForm((current) => {
+                                                const updated = { ...current, products };
+                                                return { ...updated, ...recalc(updated, { autoRoundOff: true }) };
+                                            });
+                                        }}
+                                    >
+                                        Add Row
+                                    </button>
                                 </div>
                                 <div style={{ display: "grid", gap: "10px" }}>
                                     {(form.products || []).map((product, index) => (
@@ -1037,10 +1244,30 @@ export default function BillsPage() {
                                                 }}
                                                 required
                                             />
-                                            <button type="button" className="panel-icon-btn" onClick={() => {
-                                                const products = (form.products || []).filter((_, row) => row !== index);
-                                                setForm((current) => ({ ...current, products, ...recalc({ ...current, products }) }));
-                                            }}><Trash2 size={16} /></button>
+                                            <button
+                                                type="button"
+                                                className="panel-icon-btn"
+                                                onClick={() => {
+                                                    const products = (form.products || []).filter((_, row) => row !== index);
+                                                    const newGross = products.reduce((s, p) => s + parseNumericValue(p.quantity) * parseNumericValue(p.price), 0);
+                                                    const updatedTaxDetails = (form.taxDetails || []).map((t) => {
+                                                        const pct = parseNumericValue(t.taxPercentage);
+                                                        if (pct > 0) {
+                                                            return {
+                                                                ...t,
+                                                                taxAmount: toFormNumber(Number(((newGross * pct) / 100).toFixed(2)))
+                                                            };
+                                                        }
+                                                        return t;
+                                                    });
+                                                    setForm((current) => {
+                                                        const updated = { ...current, products, taxDetails: updatedTaxDetails };
+                                                        return { ...updated, ...recalc(updated, { autoRoundOff: true }) };
+                                                    });
+                                                }}
+                                            >
+                                                <Trash2 size={16} />
+                                            </button>
                                         </div>
                                     ))}
                                 </div>
@@ -1050,40 +1277,56 @@ export default function BillsPage() {
                                 <h3 className="bill-section-title">Taxes & Totals</h3>
                                 {(form.taxDetails || []).map((tax, index) => (
                                     <div key={index} className="form-grid-4" style={{ marginBottom: "10px" }}>
-                                        <input className="input-field" placeholder="Tax type" value={tax.taxType} onChange={(e) => setTax(index, "taxType", e.target.value)} />
+                                        <select
+                                            className="input-field"
+                                            value={tax.taxType || "CGST"}
+                                            onChange={(e) => setTaxType(index, e.target.value)}
+                                        >
+                                            <option value="CGST">CGST</option>
+                                            <option value="SGST">SGST</option>
+                                            <option value="IGST">IGST</option>
+                                            <option value="UTGST">UTGST</option>
+                                            <option value="Tax">Other Tax</option>
+                                        </select>
                                         <input
                                             className="input-field"
                                             inputMode="decimal"
                                             placeholder="Tax %"
                                             value={toFormNumber(tax.taxPercentage)}
-                                            onChange={(e) => {
-                                                if (!isValidNumericInput(e.target.value)) return;
-                                                setTax(index, "taxPercentage", e.target.value);
-                                            }}
+                                            onChange={(e) => setTaxPercentage(index, e.target.value)}
                                         />
                                         <input
                                             className="input-field"
                                             inputMode="decimal"
                                             placeholder="Tax amount"
                                             value={toFormNumber(tax.taxAmount)}
-                                            onChange={(e) => {
-                                                if (!isValidNumericInput(e.target.value)) return;
-                                                setTax(index, "taxAmount", e.target.value);
-                                            }}
+                                            onChange={(e) => setTaxAmount(index, e.target.value)}
                                         />
-                                        <button type="button" className="panel-icon-btn" onClick={() => {
-                                            const taxDetails = (form.taxDetails || []).filter((_, row) => row !== index);
-                                            setForm((current) => ({ ...current, taxDetails, ...recalc({ ...current, taxDetails }) }));
-                                        }}><Trash2 size={16} /></button>
+                                        <button type="button" className="panel-icon-btn" onClick={() => removeTax(index)}>
+                                            <Trash2 size={16} />
+                                        </button>
                                     </div>
                                 ))}
                                 <div style={{ display: "flex", gap: "10px", marginBottom: "12px" }}>
-                                    <button type="button" className="btn-secondary" onClick={() => setForm({ ...form, taxDetails: [...(form.taxDetails || []), { taxType: "CGST", taxPercentage: "", taxAmount: "" }] })}>Add Tax</button>
+                                    <button type="button" className="btn-secondary" onClick={addTaxRow}>Add Tax</button>
                                 </div>
                                 <div className="form-grid-3">
-                                    <div><label className="section-label">Freight</label><input className="input-field" inputMode="decimal" placeholder="0" value={toFormNumber(form.freightAndForwardingCharges)} onChange={(e) => setFormNumericField("freightAndForwardingCharges", e.target.value)} /></div>
                                     <div>
-                                        <label className="section-label">Round Off</label>
+                                        <label className="section-label">Freight</label>
+                                        <input className="input-field" inputMode="decimal" placeholder="0" value={toFormNumber(form.freightAndForwardingCharges)} onChange={(e) => setFormNumericField("freightAndForwardingCharges", e.target.value)} />
+                                    </div>
+                                    <div>
+                                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                                            <label className="section-label">Round Off</label>
+                                            <button
+                                                type="button"
+                                                style={{ fontSize: "0.75rem", color: "var(--primary-color)", background: "none", border: "none", cursor: "pointer", padding: "0 0 2px 0", fontWeight: 500 }}
+                                                onClick={applyAutoRoundOff}
+                                                title="Calculate exact round off"
+                                            >
+                                                Auto Round
+                                            </button>
+                                        </div>
                                         <div style={{ display: "grid", gridTemplateColumns: "120px minmax(0, 1fr)", gap: "8px" }}>
                                             <select
                                                 className="input-field"
@@ -1096,19 +1339,31 @@ export default function BillsPage() {
                                                     });
                                                 }}
                                             >
-                                                <option value="positive">Positive</option>
-                                                <option value="negative">Negative</option>
+                                                <option value="positive">Positive (+)</option>
+                                                <option value="negative">Negative (-)</option>
                                             </select>
                                             <input
                                                 className="input-field"
                                                 inputMode="decimal"
                                                 placeholder="0"
-                                                value={toFormNumber(form.roundOff)}
-                                                onChange={(e) => setFormNumericField("roundOff", e.target.value, true)}
+                                                value={toFormNumber(form.roundOff ? Math.abs(parseNumericValue(form.roundOff)) : "")}
+                                                onChange={(e) => {
+                                                    const sign = getRoundOffSign(form.roundOff);
+                                                    const rawVal = e.target.value.replace(/^-/, "").trim();
+                                                    if (!isValidNumericInput(rawVal)) return;
+                                                    const signedVal = rawVal ? (sign === "negative" ? `-${rawVal}` : rawVal) : "";
+                                                    setForm((current) => {
+                                                        const next = { ...current, roundOff: signedVal };
+                                                        return { ...next, ...recalc(next) };
+                                                    });
+                                                }}
                                             />
                                         </div>
                                     </div>
-                                    <div><label className="section-label">Total</label><input className="input-field" value={formatCurrencyINR(form.amount)} disabled /></div>
+                                    <div>
+                                        <label className="section-label">Total</label>
+                                        <input className="input-field" value={formatCurrencyINR(form.amount)} disabled />
+                                    </div>
                                 </div>
                             </div>
 

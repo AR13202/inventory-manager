@@ -28,6 +28,7 @@ import {
 } from "lucide-react";
 import { updateOrganizationProfile } from "@/utils/firebaseHelpers/orgs";
 import { escapeHtml, openPrintWindow } from "@/utils/print";
+import { compressImageForUpload } from "@/utils/imageCompressor";
 
 type HomeTab = "overview" | "outstanding";
 type RevenueRange = "3m" | "6m" | "12m";
@@ -666,11 +667,13 @@ export default function OrgHomePage() {
       reader.readAsDataURL(file);
     });
 
+    const compressedDataUrl = await compressImageForUpload(dataUrl, 800, 0.8);
+
     const response = await fetch("/api/upload", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        file: dataUrl,
+        file: compressedDataUrl,
         fileName: file.name,
         mimeType: file.type,
       }),

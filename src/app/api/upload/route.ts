@@ -24,7 +24,8 @@ export async function POST(request: Request) {
 
         const isPdf = String(mimeType || "").includes("pdf");
         const resourceType = isPdf ? "raw" : "image";
-        const uploadResponse = await cloudinary.uploader.upload(file, {
+
+        const uploadOptions: Record<string, any> = {
             folder: "inventory_bills",
             resource_type: resourceType,
             type: "authenticated",
@@ -32,7 +33,24 @@ export async function POST(request: Request) {
             invalidate: true,
             use_filename: true,
             filename_override: fileName || undefined
-        });
+        };
+
+        // For image assets, compress to minimum size while maintaining document legibility
+        if (!isPdf) {
+            uploadOptions.transformation = [
+                {
+                    width: 1600,
+                    height: 2400,
+                    crop: "limit",
+                    quality: "auto:eco",
+                    fetch_format: "auto",
+                    flags: "lossy"
+                }
+            ];
+            uploadOptions.format = "webp";
+        }
+
+        const uploadResponse = await cloudinary.uploader.upload(file, uploadOptions);
 
         return NextResponse.json({
             success: true,

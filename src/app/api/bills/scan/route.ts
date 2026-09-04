@@ -6,55 +6,8 @@ const geminiApiKey = process.env.GEMINI_API_KEY || process.env.NEXT_PUBLIC_GEMIN
 const groqApiKey = process.env.GROQ_API_KEY || process.env.NEXT_PUBLIC_GROQ_API_KEY || process.env.GROK_API_KEY || process.env.NEXT_PUBLIC_GROK_API_KEY;
 const openRouterApiKey = process.env.OPENROUTER_API_KEY || process.env.NEXT_PUBLIC_OPENROUTER_API_KEY;
 
-const prompt = `
-You are an expert OCR and invoice data extraction system. Analyze this invoice/bill image with extreme care and return ONLY raw JSON — no markdown, no explanation, no code fences.
-
-CRITICAL EXTRACTION RULES — READ CAREFULLY:
-
-## Company Identification
-- "parentCompanyDetails" = the SELLER / ISSUER of the invoice (whose letterhead/logo is at the top, who signed it as "Authorised Signatory")
-- "customerCompanyDetails" = the BUYER / "Billed To" party
-- Always extract GST numbers for BOTH parties if visible anywhere on the document
-
-## Bill Number
-- Look for: Invoice No., Bill No., Voucher No., Sr. No. at the top of the document
-- This is almost always present — look carefully before leaving it empty
-
-## Date
-- Look for: Date, Dated, Invoice Date fields
-- Format as YYYY-MM-DD
-
-## billType Logic
-- If the parentCompanyDetails company is the one ISSUING/SELLING → "Sale"
-- If the document was received FROM a supplier (i.e., you are the buyer in customerCompanyDetails) → "Purchase"
-- Determine this from context: if "Alliance Engineering" is in "Billed To / Shipped To", it's a Purchase invoice FOR Alliance Engineering
-
-## Items Extraction — MOST CRITICAL SECTION
-- Read EVERY row in the items table meticulously
-- Match each item's: description, HSN/SAC code, quantity, unit, and unit price (Rate column)
-- "price" = unit rate per item, NOT the line total
-- Do NOT confuse line total (Amount) with unit price (Rate/Price)
-- If an item has a sub-description or note on the next line (e.g., "ID 10mm"), append it to the item name
-- Do NOT skip any line items — count all rows carefully before finalizing
-
-## Tax Details
-- Extract EACH tax component separately: CGST, SGST, IGST, UTGST, VAT etc.
-- Some invoices use UTGST instead of SGST for union territories (e.g., Chandigarh)
-- taxPercentage for each component = that component's individual rate (e.g., 9% each for CGST+SGST, not 18% total)
-- taxAmount = the actual rupee amount for each component
-- Top-level taxAmount = SUM of all tax components
-- Top-level taxPercentage = TOTAL effective tax rate
-
-## Amounts
-- freightAndForwardingCharges: Look for "Freight", "F&F", "Forwarding", "Packing" line items
-- roundOff: Look for "Round Off" or "Rounded Off" lines (can be negative)
-- totalAmount = Grand Total / Total Amount After Tax (the final payable amount)
-
-## Validation Check (do this before returning):
-- Sum of (quantity × price) for all items + tax + freight + roundOff should approximately equal totalAmount
-- If your numbers don't add up, re-read the invoice more carefully
-
-Return this exact schema:
+const extractionSchemaPrompt = `
+Return this exact JSON schema:
 {
   "parentCompanyDetails": {
     "name": "",
@@ -68,14 +21,14 @@ Return this exact schema:
     "address": "",
     "phoneNumbers": ""
   },
-  "date": "",
+  "date": "YYYY-MM-DD",
   "billNumber": "",
   "billType": "Purchase or Sale or Unknown",
   "taxAmount": 0,
   "taxPercentage": 0,
   "taxDetails": [
     {
-      "taxType": "",
+      "taxType": "CGST / SGST / IGST / UTGST / Tax",
       "taxPercentage": 0,
       "taxAmount": 0
     }
@@ -96,7 +49,70 @@ Return this exact schema:
 }
 `;
 
-type ScanProvider = "gemini" | "groq" | "openrouter";
+const visionPrompt = `
+You are an expert OCR and invoice data extraction system. Analyze the provided invoice/bill image(s) with extreme care and return ONLY raw JSON — no markdown, no explanation, no code fences.
+
+CRITICAL MULTI-PAGE & EXTRACTION RULES:
+
+## Multi-Page Invoice Handling
+- The input may contain 1, 2, 3, or more pages belonging to THE SAME SINGLE INVOICE.
+- Combine and extract ALL line items across ALL pages sequentially into the single "items" array.
+- Do NOT stop after the first page. Extract every single product row across all pages without omission.
+- The Seller/Buyer details, Bill Number, and Date are typically on Page 1 or repeated in page headers.
+- The final Tax Summary, Round Off, Freight, and Grand Total are typically on the last page.
+
+## Company Identification
+- "parentCompanyDetails" = the SELLER / ISSUER of the invoice (whose letterhead/logo is at the top, who signed it as "Authorised Signatory")
+- "customerCompanyDetails" = the BUYER / "Billed To" party
+- Always extract GST numbers for BOTH parties if visible anywhere on the document
+
+## Bill Number & Date
+- Look for: Invoice No., Bill No., Voucher No., Sr. No. at the top of the document
+- Date: Look for Date, Dated, Invoice Date fields. Format as YYYY-MM-DD.
+
+## billType Logic
+- If the parentCompanyDetails company is the one ISSUING/SELLING → "Sale"
+- If the document was received FROM a supplier (i.e., you are the buyer in customerCompanyDetails) → "Purchase"
+- If "Alliance Engineering" is in "Billed To / Shipped To", it's a Purchase invoice FOR Alliance Engineering
+
+## Items Extraction — MOST CRITICAL SECTION
+- Read EVERY row in the items table across all pages meticulously
+- Match each item's: description, HSN/SAC code, quantity, unit, and unit price (Rate column)
+- "price" = unit rate per item, NOT the line total
+- Do NOT confuse line total (Amount) with unit price (Rate/Price)
+- Do NOT skip any line items — count all rows across all pages carefully before finalizing
+
+## Tax Details & Grand Total
+- Extract EACH tax component separately: CGST, SGST, IGST, UTGST etc.
+- top-level taxAmount = SUM of all tax components
+- totalAmount = Grand Total / Total Amount After Tax (the final payable amount)
+
+${extractionSchemaPrompt}
+`;
+
+const textPrompt = `
+You are an expert invoice data extraction system. You are given raw OCR text extracted from an invoice or bill (which may span multiple pages).
+Your job is to interpret this unstructured OCR text, accurately extract all required invoice fields across all pages, and return ONLY raw JSON matching the required schema — no markdown, no explanation, no code fences.
+
+CRITICAL MULTI-PAGE & EXTRACTION INSTRUCTIONS:
+1. Multi-Page Fusion: The text may contain multiple pages (marked by "=== INVOICE PAGE X OF Y ==="). Combine all line items across all pages sequentially into the single "items" list.
+2. "parentCompanyDetails": The SELLER / ISSUER (usually at the top of the bill, or under 'Consignor'/'Supplier'/'From'). Extract their Name, GSTIN (15-character GST number), Address, and Phone.
+3. "customerCompanyDetails": The BUYER / CUSTOMER (under 'Billed To' / 'Consignee' / 'Buyer' / 'To'). Extract their Name, GSTIN, Address, and Phone.
+4. "billNumber": Look for "Invoice No", "Bill No", "Inv No", "Voucher No", "Sr No".
+5. "date": Look for "Date", "Dated", "Invoice Date". Format as YYYY-MM-DD.
+6. "billType": Set to "Purchase" if billed to us / received from supplier, or "Sale" if we are issuing the bill.
+7. "items": Extract EVERY item row across all pages.
+   - Match item description/name, HSN/SAC code, quantity, unit (e.g. PCS, NOS, KGS, MTR, SET), and unit rate (Price).
+   - "price" is unit rate, NOT total amount.
+   - Do not skip line items.
+8. "taxDetails": Extract CGST, SGST, IGST, UTGST as separate tax rows with percentage and rupee amount.
+9. "freightAndForwardingCharges", "roundOff", and "totalAmount": Extract from final summary/total rows.
+10. Do not invent missing data. If not found in text, leave as empty string or 0.
+
+${extractionSchemaPrompt}
+`;
+
+type ScanProvider = "openrouter" | "gemini" | "groq";
 
 type CompanyDetails = {
     name: string;
@@ -162,7 +178,7 @@ function normalizeBillType(value: unknown): NormalizedScanReceiptData["billType"
 }
 
 function normalizeCompanyDetails(value: unknown): CompanyDetails {
-    const objectValue = typeof value === "object" && value !== null ? value as Record<string, unknown> : {};
+    const objectValue = typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
     return {
         name: normalizeString(objectValue.name),
         gst: normalizeString(objectValue.gst),
@@ -174,7 +190,7 @@ function normalizeCompanyDetails(value: unknown): CompanyDetails {
 function normalizeTaxDetails(value: unknown): TaxDetail[] {
     if (!Array.isArray(value)) return [];
     return value.map((tax) => {
-        const objectValue = typeof tax === "object" && tax !== null ? tax as Record<string, unknown> : {};
+        const objectValue = typeof tax === "object" && tax !== null ? (tax as Record<string, unknown>) : {};
         return {
             taxType: normalizeString(objectValue.taxType) || "Tax",
             taxPercentage: normalizeNumber(objectValue.taxPercentage),
@@ -186,7 +202,7 @@ function normalizeTaxDetails(value: unknown): TaxDetail[] {
 function normalizeItems(value: unknown): ScannedItem[] {
     if (!Array.isArray(value)) return [];
     return value.map((item) => {
-        const objectValue = typeof item === "object" && item !== null ? item as Record<string, unknown> : {};
+        const objectValue = typeof item === "object" && item !== null ? (item as Record<string, unknown>) : {};
         return {
             name: normalizeString(objectValue.name),
             hsn: normalizeString(objectValue.hsn),
@@ -199,7 +215,7 @@ function normalizeItems(value: unknown): ScannedItem[] {
 }
 
 function normalizeScanResponse(value: unknown): NormalizedScanReceiptData {
-    const objectValue = typeof value === "object" && value !== null ? value as Record<string, unknown> : {};
+    const objectValue = typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
     const taxDetails = normalizeTaxDetails(objectValue.taxDetails);
 
     return {
@@ -219,7 +235,7 @@ function normalizeScanResponse(value: unknown): NormalizedScanReceiptData {
 }
 
 function extractJsonText(value: string) {
-    return value.replace(/```json/g, "").replace(/```/g, "").trim();
+    return value.replace(/```json/gi, "").replace(/```/g, "").trim();
 }
 
 function parseBase64Image(image: string) {
@@ -232,43 +248,208 @@ function parseBase64Image(image: string) {
     };
 }
 
-async function scanWithGemini(image: string) {
+// ==========================================
+// TEXT LLM PARSERS (FREE & ULTRA FAST)
+// ==========================================
+
+const OPENROUTER_TEXT_MODELS = [
+    "minimax/minimax-m3:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "google/gemini-2.0-flash-exp:free",
+    "google/gemini-2.0-flash-thinking-exp:free",
+    "mistralai/mistral-7b-instruct:free",
+    "qwen/qwen-2.5-72b-instruct:free"
+];
+
+async function scanTextWithOpenRouter(ocrText: string) {
+    if (!openRouterApiKey) {
+        throw new Error("OpenRouter API key is not configured.");
+    }
+
+    let lastError: Error = new Error("No text models available.");
+
+    for (const model of OPENROUTER_TEXT_MODELS) {
+        try {
+            console.log(`[bill-scan-text] trying OpenRouter model: ${model}`);
+            const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+                method: "POST",
+                headers: {
+                    Authorization: `Bearer ${openRouterApiKey}`,
+                    "Content-Type": "application/json",
+                    "X-Title": "Invoice Scanner OCR"
+                },
+                body: JSON.stringify({
+                    model,
+                    temperature: 0,
+                    messages: [
+                        { role: "system", content: textPrompt },
+                        { role: "user", content: `Here is the OCR text from the invoice:\n\n${ocrText}` }
+                    ]
+                })
+            });
+
+            if (response.status === 429 || response.status >= 500) {
+                lastError = new Error(`Model ${model} HTTP ${response.status}`);
+                continue;
+            }
+
+            if (!response.ok) {
+                const payload = await response.json().catch(() => ({}));
+                throw new Error(payload?.error?.message || `OpenRouter request failed: ${response.status}`);
+            }
+
+            const payload = await response.json();
+            const content = payload?.choices?.[0]?.message?.content;
+            const text = Array.isArray(content)
+                ? content.map((entry: { text?: string }) => entry?.text || "").join("")
+                : String(content || "");
+
+            if (!text.trim()) continue;
+
+            const json = JSON.parse(extractJsonText(text));
+            console.log(`[bill-scan-text] succeeded with model: ${model}`);
+            return json;
+        } catch (err) {
+            lastError = err instanceof Error ? err : new Error(String(err));
+            console.warn(`[bill-scan-text] Model ${model} failed: ${lastError.message}`);
+        }
+    }
+
+    throw new Error(`All OpenRouter text models failed. Last error: ${lastError.message}`);
+}
+
+async function scanTextWithGroq(ocrText: string) {
+    if (!groqApiKey) {
+        throw new Error("Groq API key is not configured.");
+    }
+
+    const groq = new Groq({ apiKey: groqApiKey });
+    const response = await groq.chat.completions.create({
+        model: "llama-3.3-70b-versatile",
+        temperature: 0,
+        messages: [
+            { role: "system", content: textPrompt },
+            { role: "user", content: `Here is the OCR text from the invoice:\n\n${ocrText}` }
+        ],
+        response_format: { type: "json_object" }
+    });
+
+    const content = response.choices[0]?.message?.content;
+    const text = Array.isArray(content)
+        ? content.map((entry) => ("text" in entry ? entry.text || "" : "")).join("")
+        : String(content || "");
+
+    if (!text.trim()) {
+        throw new Error("Groq text extraction returned empty response.");
+    }
+
+    return JSON.parse(extractJsonText(text));
+}
+
+async function scanTextWithGemini(ocrText: string) {
     if (!geminiApiKey) {
         throw new Error("Gemini API key is not configured.");
     }
-    console.log("Scanning with Gemini...");
 
-    const { base64Data, mimeType } = parseBase64Image(image);
     const genAI = new GoogleGenerativeAI(geminiApiKey);
     const model = genAI.getGenerativeModel({
-        model: "gemma3-12b",
+        model: "gemini-2.0-flash",
         generationConfig: {
             responseMimeType: "application/json"
         }
     });
 
     const result = await model.generateContent([
-        prompt,
-        {
-            inlineData: {
-                data: base64Data,
-                mimeType
-            }
-        }
+        textPrompt,
+        `Here is the OCR text from the invoice:\n\n${ocrText}`
     ]);
 
     return JSON.parse(extractJsonText(result.response.text()));
 }
 
-async function scanWithGroq(image: string) {
+async function scanOCRWithFallback(ocrText: string) {
+    const providers: Array<{ name: ScanProvider; scan: (text: string) => Promise<unknown> }> = [
+        { name: "openrouter", scan: scanTextWithOpenRouter },
+        { name: "groq", scan: scanTextWithGroq },
+        { name: "gemini", scan: scanTextWithGemini }
+    ];
+    const errors: ProviderError[] = [];
+
+    for (const provider of providers) {
+        try {
+            console.log(`[bill-scan-ocr] trying provider: ${provider.name}`);
+            const parsed = await provider.scan(ocrText);
+            console.log(`[bill-scan-ocr] provider succeeded: ${provider.name}`);
+            return {
+                provider: provider.name,
+                data: normalizeScanResponse(parsed),
+                errors
+            };
+        } catch (error) {
+            const message = error instanceof Error ? error.message : "Unknown scanning error.";
+            console.error(`[bill-scan-ocr] provider failed: ${provider.name}`, error);
+            errors.push({ provider: provider.name, message });
+        }
+    }
+
+    throw Object.assign(new Error("Failed to interpret OCR text with LLM."), { providerErrors: errors });
+}
+
+// ==========================================
+// MULTIMODAL VISION LLM PARSERS (FALLBACK)
+// ==========================================
+
+const OPENROUTER_VISION_MODELS = [
+    "minimax/minimax-m3:free",
+    "google/gemma-4-31b-it:free",
+    "google/gemma-4-26b-a4b-it:free",
+    "google/gemma-3-27b-it:free",
+    "qwen/qwen2.5-vl-72b-instruct:free",
+    "qwen/qwen2.5-vl-32b-instruct:free",
+    "meta-llama/llama-3.2-11b-vision-instruct:free",
+    "google/gemma-3-12b-it:free"
+];
+
+async function scanWithGemini(images: string[]) {
+    if (!geminiApiKey) {
+        throw new Error("Gemini API key is not configured.");
+    }
+
+    const imageParts = images.map((img) => {
+        const { base64Data, mimeType } = parseBase64Image(img);
+        return {
+            inlineData: {
+                data: base64Data,
+                mimeType
+            }
+        };
+    });
+
+    const genAI = new GoogleGenerativeAI(geminiApiKey);
+    const model = genAI.getGenerativeModel({
+        model: "gemini-2.0-flash",
+        generationConfig: {
+            responseMimeType: "application/json"
+        }
+    });
+
+    const result = await model.generateContent([
+        visionPrompt,
+        ...imageParts
+    ]);
+
+    return JSON.parse(extractJsonText(result.response.text()));
+}
+
+async function scanWithGroq(images: string[]) {
     if (!groqApiKey) {
         throw new Error("Groq API key is not configured.");
     }
-    console.log("Scanning with Groq...");
-    const { dataUrl, mimeType } = parseBase64Image(image);
-    if (!mimeType.startsWith("image/")) {
-        throw new Error(`Groq vision fallback does not support ${mimeType} files.`);
-    }
+
+    const imageContents = images.map((img) => {
+        const { dataUrl } = parseBase64Image(img);
+        return { type: "image_url" as const, image_url: { url: dataUrl } };
+    });
 
     const groq = new Groq({ apiKey: groqApiKey });
     const response = await groq.chat.completions.create({
@@ -278,16 +459,8 @@ async function scanWithGroq(image: string) {
             {
                 role: "user",
                 content: [
-                    {
-                        type: "text",
-                        text: prompt
-                    },
-                    {
-                        type: "image_url",
-                        image_url: {
-                            url: dataUrl
-                        }
-                    }
+                    { type: "text", text: visionPrompt },
+                    ...imageContents
                 ]
             }
         ],
@@ -303,46 +476,31 @@ async function scanWithGroq(image: string) {
         throw new Error("Groq returned an empty response.");
     }
 
-    try {
-        return JSON.parse(extractJsonText(text));
-    } catch (error) {
-        throw new Error(`Groq returned invalid JSON: ${error instanceof Error ? error.message : "Unknown parse error."}`);
-    }
+    return JSON.parse(extractJsonText(text));
 }
 
-// Best to OK order: accuracy + speed + stability on free tier
-const OPENROUTER_VISION_MODELS = [
-    "google/gemma-4-31b-it:free",
-    "google/gemma-4-26b-a4b-it:free",
-    "google/gemma-3-27b-it:free",                     // Good - stable, confirmed working
-    "qwen/qwen2.5-vl-72b-instruct:free",              // Best - largest, great at tables/line items
-    "qwen/qwen2.5-vl-32b-instruct:free",              // Great - slightly smaller but very fast
-    "meta-llama/llama-3.2-11b-vision-instruct:free",  // OK - lightweight fallback
-    "google/gemma-3-12b-it:free",                     // Last resort - smaller, less accurate
-];
-
-async function scanWithOpenRouter(image: string) {
+async function scanWithOpenRouter(images: string[]) {
     if (!openRouterApiKey) {
         throw new Error("OpenRouter API key is not configured.");
     }
 
-    const { dataUrl, mimeType } = parseBase64Image(image);
-    if (!mimeType.startsWith("image/")) {
-        throw new Error(`OpenRouter vision fallback does not support ${mimeType} files.`);
-    }
+    const imageContents = images.map((img) => {
+        const { dataUrl } = parseBase64Image(img);
+        return { type: "image_url", image_url: { url: dataUrl } };
+    });
 
     let lastError: Error = new Error("No models available.");
 
     for (const model of OPENROUTER_VISION_MODELS) {
         try {
-            console.log(`Scanning with OpenRouter model: ${model}`);
+            console.log(`[bill-scan-vision] Scanning with OpenRouter model: ${model}`);
 
             const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
                 method: "POST",
                 headers: {
                     Authorization: `Bearer ${openRouterApiKey}`,
                     "Content-Type": "application/json",
-                    "X-Title": "Invoice Scanner"
+                    "X-Title": "Invoice Scanner Vision"
                 },
                 body: JSON.stringify({
                     model,
@@ -351,89 +509,55 @@ async function scanWithOpenRouter(image: string) {
                         {
                             role: "user",
                             content: [
-                                { type: "text", text: prompt },
-                                { type: "image_url", image_url: { url: dataUrl } }
+                                { type: "text", text: visionPrompt },
+                                ...imageContents
                             ]
                         }
                     ]
                 })
             });
 
-            const payload = await response.json();
-
-            // These status codes mean model/provider is down — try next
-            if (response.status === 500 || response.status === 529 || response.status === 503) {
-                const reason = payload?.error?.message || `HTTP ${response.status}`;
-                console.warn(`Model ${model} unavailable: ${reason}, trying next...`);
-                lastError = new Error(reason);
+            if (response.status === 500 || response.status === 529 || response.status === 503 || response.status === 429) {
+                lastError = new Error(`Model ${model} HTTP ${response.status}`);
                 continue;
             }
 
-            // Rate limited — try next model
-            if (response.status === 429) {
-                console.warn(`Model ${model} rate limited, trying next...`);
-                lastError = new Error(`${model} rate limited`);
-                continue;
-            }
-
-            // Other non-OK responses — throw immediately (auth error, bad request etc)
             if (!response.ok) {
-                const apiMessage =
-                    payload?.error?.message ||
-                    payload?.message ||
-                    `OpenRouter request failed with status ${response.status}`;
-                throw new Error(apiMessage);
+                const payload = await response.json().catch(() => ({}));
+                throw new Error(payload?.error?.message || `OpenRouter request failed with status ${response.status}`);
             }
 
+            const payload = await response.json();
             const content = payload?.choices?.[0]?.message?.content;
             const text = Array.isArray(content)
                 ? content.map((entry: { text?: string }) => entry?.text || "").join("")
                 : String(content || "");
 
-            // Empty response — try next model
-            if (!text.trim()) {
-                console.warn(`Model ${model} returned empty response, trying next...`);
-                lastError = new Error(`${model} returned empty response`);
-                continue;
-            }
+            if (!text.trim()) continue;
 
-            // Invalid JSON — try next model
-            try {
-                const result = JSON.parse(extractJsonText(text));
-                console.log(`Successfully scanned with model: ${model}`);
-                return result;
-            } catch {
-                console.warn(`Model ${model} returned invalid JSON, trying next...`);
-                lastError = new Error(`${model} returned invalid JSON`);
-                continue;
-            }
-
+            return JSON.parse(extractJsonText(text));
         } catch (err) {
-            // Only rethrow if it's not a retriable error
-            if (err instanceof Error && !err.message.includes("rate limit") && !err.message.includes("unavailable")) {
-                throw err;
-            }
             lastError = err instanceof Error ? err : new Error(String(err));
-            console.warn(`Model ${model} failed: ${lastError.message}, trying next...`);
+            console.warn(`[bill-scan-vision] Model ${model} failed: ${lastError.message}`);
         }
     }
 
-    throw new Error(`All OpenRouter models failed. Last error: ${lastError.message}`);
+    throw new Error(`All OpenRouter vision models failed. Last error: ${lastError.message}`);
 }
 
-async function scanWithFallback(image: string) {
-    const providers: Array<{ name: ScanProvider; scan: (value: string) => Promise<unknown> }> = [
+async function scanWithFallback(images: string[]) {
+    const providers: Array<{ name: ScanProvider; scan: (imgs: string[]) => Promise<unknown> }> = [
         { name: "openrouter", scan: scanWithOpenRouter },
         { name: "gemini", scan: scanWithGemini },
-        { name: "groq", scan: scanWithGroq },
+        { name: "groq", scan: scanWithGroq }
     ];
     const errors: ProviderError[] = [];
 
     for (const provider of providers) {
         try {
-            console.log(`[bill-scan] trying provider: ${provider.name}`);
-            const parsed = await provider.scan(image);
-            console.log(`[bill-scan] provider succeeded: ${provider.name}`);
+            console.log(`[bill-scan-vision] trying provider: ${provider.name}`);
+            const parsed = await provider.scan(images);
+            console.log(`[bill-scan-vision] provider succeeded: ${provider.name}`);
             return {
                 provider: provider.name,
                 data: normalizeScanResponse(parsed),
@@ -441,29 +565,50 @@ async function scanWithFallback(image: string) {
             };
         } catch (error) {
             const message = error instanceof Error ? error.message : "Unknown scanning error.";
-            console.error(`[bill-scan] provider failed: ${provider.name}`, error);
-            console.error(`${provider.name} scanning error:`, error);
+            console.error(`[bill-scan-vision] provider failed: ${provider.name}`, error);
             errors.push({ provider: provider.name, message });
         }
     }
 
-    throw Object.assign(new Error("Failed to scan receipt."), { providerErrors: errors });
+    throw Object.assign(new Error("Failed to scan receipt via vision models."), { providerErrors: errors });
 }
+
+// ==========================================
+// HTTP HANDLER
+// ==========================================
 
 export async function POST(request: Request) {
     try {
-        const { image } = await request.json();
-        if (!image) {
-            return NextResponse.json({ success: false, error: "No image provided." }, { status: 400 });
+        const body = await request.json();
+        const { ocrText, image, images } = body;
+
+        // Path A: Fast Client OCR Text provided
+        if (typeof ocrText === "string" && ocrText.trim().length > 0) {
+            const result = await scanOCRWithFallback(ocrText.trim());
+            return NextResponse.json({
+                success: true,
+                mode: "ocr_text",
+                provider: result.provider,
+                data: result.data
+            });
         }
 
-        const result = await scanWithFallback(String(image));
+        // Path B: Vision Image(s) Fallback
+        const imagesList: string[] = Array.isArray(images) && images.length > 0
+            ? images
+            : (typeof image === "string" && image.length > 0 ? [image] : []);
 
-        return NextResponse.json({
-            success: true,
-            provider: result.provider,
-            data: result.data
-        });
+        if (imagesList.length > 0) {
+            const result = await scanWithFallback(imagesList);
+            return NextResponse.json({
+                success: true,
+                mode: "vision_image",
+                provider: result.provider,
+                data: result.data
+            });
+        }
+
+        return NextResponse.json({ success: false, error: "Neither ocrText nor images were provided." }, { status: 400 });
     } catch (error: unknown) {
         const providerErrors = Array.isArray((error as { providerErrors?: ProviderError[] })?.providerErrors)
             ? (error as { providerErrors: ProviderError[] }).providerErrors

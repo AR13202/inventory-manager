@@ -2,9 +2,9 @@ import { NextResponse } from "next/server";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import Groq from "groq-sdk";
 
-const geminiApiKey = process.env.GEMINI_API_KEY || process.env.NEXT_PUBLIC_GEMINI_API_KEY;
-const groqApiKey = process.env.GROQ_API_KEY || process.env.NEXT_PUBLIC_GROQ_API_KEY || process.env.GROK_API_KEY || process.env.NEXT_PUBLIC_GROK_API_KEY;
-const openRouterApiKey = process.env.OPENROUTER_API_KEY || process.env.NEXT_PUBLIC_OPENROUTER_API_KEY;
+const geminiApiKey = process.env.GEMINI_API_KEY;
+const groqApiKey = process.env.GROQ_API_KEY || process.env.GROK_API_KEY;
+const openRouterApiKey = process.env.OPENROUTER_API_KEY;
 
 const extractionSchemaPrompt = `
 Return this exact JSON schema:
@@ -252,108 +252,89 @@ function parseBase64Image(image: string) {
 // TEXT LLM PARSERS (FREE & ULTRA FAST)
 // ==========================================
 
-const OPENROUTER_TEXT_MODELS = [
-    "minimax/minimax-m3:free",
-    "meta-llama/llama-3.3-70b-instruct:free",
-    "google/gemini-2.0-flash-exp:free",
-    "google/gemini-2.0-flash-thinking-exp:free",
-    "mistralai/mistral-7b-instruct:free",
-    "qwen/qwen-2.5-72b-instruct:free"
+const GROQ_TEXT_MODELS = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant"
 ];
 
-async function scanTextWithOpenRouter(ocrText: string) {
-    if (!openRouterApiKey) {
-        throw new Error("OpenRouter API key is not configured.");
-    }
+export type ProgressCallback = (status: {
+    stage: "text" | "vision";
+    model: string;
+    phase: string;
+    index?: number;
+    total?: number;
+}) => void;
 
-    let lastError: Error = new Error("No text models available.");
-
-    for (const model of OPENROUTER_TEXT_MODELS) {
-        try {
-            console.log(`[bill-scan-text] trying OpenRouter model: ${model}`);
-            const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-                method: "POST",
-                headers: {
-                    Authorization: `Bearer ${openRouterApiKey}`,
-                    "Content-Type": "application/json",
-                    "X-Title": "Invoice Scanner OCR"
-                },
-                body: JSON.stringify({
-                    model,
-                    temperature: 0,
-                    messages: [
-                        { role: "system", content: textPrompt },
-                        { role: "user", content: `Here is the OCR text from the invoice:\n\n${ocrText}` }
-                    ]
-                })
-            });
-
-            if (response.status === 429 || response.status >= 500) {
-                lastError = new Error(`Model ${model} HTTP ${response.status}`);
-                continue;
-            }
-
-            if (!response.ok) {
-                const payload = await response.json().catch(() => ({}));
-                throw new Error(payload?.error?.message || `OpenRouter request failed: ${response.status}`);
-            }
-
-            const payload = await response.json();
-            const content = payload?.choices?.[0]?.message?.content;
-            const text = Array.isArray(content)
-                ? content.map((entry: { text?: string }) => entry?.text || "").join("")
-                : String(content || "");
-
-            if (!text.trim()) continue;
-
-            const json = JSON.parse(extractJsonText(text));
-            console.log(`[bill-scan-text] succeeded with model: ${model}`);
-            return json;
-        } catch (err) {
-            lastError = err instanceof Error ? err : new Error(String(err));
-            console.warn(`[bill-scan-text] Model ${model} failed: ${lastError.message}`);
-        }
-    }
-
-    throw new Error(`All OpenRouter text models failed. Last error: ${lastError.message}`);
-}
-
-async function scanTextWithGroq(ocrText: string) {
+async function scanTextWithGroq(ocrText: string, onProgress?: ProgressCallback) {
     if (!groqApiKey) {
         throw new Error("Groq API key is not configured.");
     }
 
     const groq = new Groq({ apiKey: groqApiKey });
-    const response = await groq.chat.completions.create({
-        model: "llama-3.3-70b-versatile",
-        temperature: 0,
-        messages: [
-            { role: "system", content: textPrompt },
-            { role: "user", content: `Here is the OCR text from the invoice:\n\n${ocrText}` }
-        ],
-        response_format: { type: "json_object" }
-    });
+    let lastError: Error = new Error("No Groq text models available.");
 
-    const content = response.choices[0]?.message?.content;
-    const text = Array.isArray(content)
-        ? content.map((entry) => ("text" in entry ? entry.text || "" : "")).join("")
-        : String(content || "");
+    for (let i = 0; i < GROQ_TEXT_MODELS.length; i++) {
+        const modelName = GROQ_TEXT_MODELS[i];
+        const attempt = i + 1;
+        const total = GROQ_TEXT_MODELS.length;
 
-    if (!text.trim()) {
-        throw new Error("Groq text extraction returned empty response.");
+        onProgress?.({
+            stage: "text",
+            model: `${modelName} (Groq)`,
+            phase: `Extracting with ${modelName} (${attempt}/${total})...`,
+            index: attempt,
+            total
+        });
+
+        console.log(`[bill-scan-text] (${attempt}/${total}) Trying Groq model: ${modelName}`);
+
+        try {
+            const response = await groq.chat.completions.create({
+                model: modelName,
+                temperature: 0,
+                messages: [
+                    { role: "system", content: textPrompt },
+                    { role: "user", content: `Here is the OCR text from the invoice:\n\n${ocrText}` }
+                ],
+                response_format: { type: "json_object" }
+            });
+
+            const content = response.choices[0]?.message?.content;
+            const text = Array.isArray(content)
+                ? content.map((entry) => ("text" in entry ? entry.text || "" : "")).join("")
+                : String(content || "");
+
+            if (!text.trim()) {
+                throw new Error(`Groq model ${modelName} returned empty response.`);
+            }
+
+            const json = JSON.parse(extractJsonText(text));
+            console.log(`[bill-scan-text] Succeeded with Groq model: ${modelName}`);
+            return { data: json, model: `${modelName} (Groq)` };
+        } catch (err) {
+            lastError = err instanceof Error ? err : new Error(String(err));
+            console.warn(`[bill-scan-text] Groq model ${modelName} failed: ${lastError.message}`);
+        }
     }
 
-    return JSON.parse(extractJsonText(text));
+    throw new Error(`All Groq text models failed. Last error: ${lastError.message}`);
 }
 
-async function scanTextWithGemini(ocrText: string) {
+async function scanTextWithGemini(ocrText: string, onProgress?: ProgressCallback) {
     if (!geminiApiKey) {
         throw new Error("Gemini API key is not configured.");
     }
 
+    const modelName = "gemini-2.0-flash";
+    onProgress?.({
+        stage: "text",
+        model: `${modelName} (Gemini)`,
+        phase: `Extracting with ${modelName} (Gemini)...`
+    });
+
     const genAI = new GoogleGenerativeAI(geminiApiKey);
     const model = genAI.getGenerativeModel({
-        model: "gemini-2.0-flash",
+        model: modelName,
         generationConfig: {
             responseMimeType: "application/json"
         }
@@ -364,35 +345,7 @@ async function scanTextWithGemini(ocrText: string) {
         `Here is the OCR text from the invoice:\n\n${ocrText}`
     ]);
 
-    return JSON.parse(extractJsonText(result.response.text()));
-}
-
-async function scanOCRWithFallback(ocrText: string) {
-    const providers: Array<{ name: ScanProvider; scan: (text: string) => Promise<unknown> }> = [
-        { name: "openrouter", scan: scanTextWithOpenRouter },
-        { name: "groq", scan: scanTextWithGroq },
-        { name: "gemini", scan: scanTextWithGemini }
-    ];
-    const errors: ProviderError[] = [];
-
-    for (const provider of providers) {
-        try {
-            console.log(`[bill-scan-ocr] trying provider: ${provider.name}`);
-            const parsed = await provider.scan(ocrText);
-            console.log(`[bill-scan-ocr] provider succeeded: ${provider.name}`);
-            return {
-                provider: provider.name,
-                data: normalizeScanResponse(parsed),
-                errors
-            };
-        } catch (error) {
-            const message = error instanceof Error ? error.message : "Unknown scanning error.";
-            console.error(`[bill-scan-ocr] provider failed: ${provider.name}`, error);
-            errors.push({ provider: provider.name, message });
-        }
-    }
-
-    throw Object.assign(new Error("Failed to interpret OCR text with LLM."), { providerErrors: errors });
+    return { data: JSON.parse(extractJsonText(result.response.text())), model: `${modelName} (Gemini)` };
 }
 
 // ==========================================
@@ -410,10 +363,17 @@ const OPENROUTER_VISION_MODELS = [
     "google/gemma-3-12b-it:free"
 ];
 
-async function scanWithGemini(images: string[]) {
+async function scanWithGemini(images: string[], onProgress?: ProgressCallback) {
     if (!geminiApiKey) {
         throw new Error("Gemini API key is not configured.");
     }
+
+    const modelName = "gemini-2.0-flash";
+    onProgress?.({
+        stage: "vision",
+        model: `${modelName} (Gemini Vision)`,
+        phase: `Analyzing images with ${modelName} (Gemini Vision)...`
+    });
 
     const imageParts = images.map((img) => {
         const { base64Data, mimeType } = parseBase64Image(img);
@@ -427,7 +387,7 @@ async function scanWithGemini(images: string[]) {
 
     const genAI = new GoogleGenerativeAI(geminiApiKey);
     const model = genAI.getGenerativeModel({
-        model: "gemini-2.0-flash",
+        model: modelName,
         generationConfig: {
             responseMimeType: "application/json"
         }
@@ -438,13 +398,20 @@ async function scanWithGemini(images: string[]) {
         ...imageParts
     ]);
 
-    return JSON.parse(extractJsonText(result.response.text()));
+    return { data: JSON.parse(extractJsonText(result.response.text())), model: `${modelName} (Gemini Vision)` };
 }
 
-async function scanWithGroq(images: string[]) {
+async function scanWithGroq(images: string[], onProgress?: ProgressCallback) {
     if (!groqApiKey) {
         throw new Error("Groq API key is not configured.");
     }
+
+    const modelName = "meta-llama/llama-4-scout-17b-16e-instruct";
+    onProgress?.({
+        stage: "vision",
+        model: `${modelName} (Groq Vision)`,
+        phase: `Analyzing images with ${modelName} (Groq Vision)...`
+    });
 
     const imageContents = images.map((img) => {
         const { dataUrl } = parseBase64Image(img);
@@ -453,7 +420,7 @@ async function scanWithGroq(images: string[]) {
 
     const groq = new Groq({ apiKey: groqApiKey });
     const response = await groq.chat.completions.create({
-        model: "meta-llama/llama-4-scout-17b-16e-instruct",
+        model: modelName,
         temperature: 0,
         messages: [
             {
@@ -476,10 +443,10 @@ async function scanWithGroq(images: string[]) {
         throw new Error("Groq returned an empty response.");
     }
 
-    return JSON.parse(extractJsonText(text));
+    return { data: JSON.parse(extractJsonText(text)), model: `${modelName} (Groq Vision)` };
 }
 
-async function scanWithOpenRouter(images: string[]) {
+async function scanWithOpenRouter(images: string[], onProgress?: ProgressCallback) {
     if (!openRouterApiKey) {
         throw new Error("OpenRouter API key is not configured.");
     }
@@ -489,12 +456,27 @@ async function scanWithOpenRouter(images: string[]) {
         return { type: "image_url", image_url: { url: dataUrl } };
     });
 
-    let lastError: Error = new Error("No models available.");
+    let lastError: Error = new Error("No vision models available.");
 
-    for (const model of OPENROUTER_VISION_MODELS) {
+    for (let i = 0; i < OPENROUTER_VISION_MODELS.length; i++) {
+        const model = OPENROUTER_VISION_MODELS[i];
+        const attempt = i + 1;
+        const total = OPENROUTER_VISION_MODELS.length;
+
+        onProgress?.({
+            stage: "vision",
+            model,
+            phase: `Analyzing images with ${model} (${attempt}/${total})...`,
+            index: attempt,
+            total
+        });
+
+        console.log(`[bill-scan-vision] (${attempt}/${total}) Scanning with OpenRouter model: ${model}`);
+
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 30000);
+
         try {
-            console.log(`[bill-scan-vision] Scanning with OpenRouter model: ${model}`);
-
             const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
                 method: "POST",
                 headers: {
@@ -514,7 +496,8 @@ async function scanWithOpenRouter(images: string[]) {
                             ]
                         }
                     ]
-                })
+                }),
+                signal: controller.signal
             });
 
             if (response.status === 500 || response.status === 529 || response.status === 503 || response.status === 429) {
@@ -535,42 +518,138 @@ async function scanWithOpenRouter(images: string[]) {
 
             if (!text.trim()) continue;
 
-            return JSON.parse(extractJsonText(text));
+            const json = JSON.parse(extractJsonText(text));
+            return { data: json, model };
         } catch (err) {
             lastError = err instanceof Error ? err : new Error(String(err));
             console.warn(`[bill-scan-vision] Model ${model} failed: ${lastError.message}`);
+        } finally {
+            clearTimeout(timeoutId);
         }
     }
 
     throw new Error(`All OpenRouter vision models failed. Last error: ${lastError.message}`);
 }
 
-async function scanWithFallback(images: string[]) {
-    const providers: Array<{ name: ScanProvider; scan: (imgs: string[]) => Promise<unknown> }> = [
-        { name: "openrouter", scan: scanWithOpenRouter },
-        { name: "gemini", scan: scanWithGemini },
-        { name: "groq", scan: scanWithGroq }
-    ];
-    const errors: ProviderError[] = [];
+// ==========================================
+// UNIFIED SCAN PIPELINE (CYCLE TEXT -> VISION)
+// ==========================================
 
-    for (const provider of providers) {
-        try {
-            console.log(`[bill-scan-vision] trying provider: ${provider.name}`);
-            const parsed = await provider.scan(images);
-            console.log(`[bill-scan-vision] provider succeeded: ${provider.name}`);
-            return {
-                provider: provider.name,
-                data: normalizeScanResponse(parsed),
-                errors
-            };
-        } catch (error) {
-            const message = error instanceof Error ? error.message : "Unknown scanning error.";
-            console.error(`[bill-scan-vision] provider failed: ${provider.name}`, error);
-            errors.push({ provider: provider.name, message });
+async function processScanPipeline(
+    ocrText: string | null,
+    images: string[],
+    onProgress?: ProgressCallback
+): Promise<{
+    mode: "ocr_text" | "vision_image";
+    provider: ScanProvider;
+    model: string;
+    data: NormalizedScanReceiptData;
+}> {
+    const textErrors: ProviderError[] = [];
+    const visionErrors: ProviderError[] = [];
+
+    // --- Step 1: Cycle through text models if OCR text is available ---
+    if (ocrText && ocrText.trim().length > 0) {
+        // Primary Text Extraction: Groq
+        if (groqApiKey) {
+            try {
+                const result = await scanTextWithGroq(ocrText, onProgress);
+                return {
+                    mode: "ocr_text",
+                    provider: "groq",
+                    model: result.model,
+                    data: normalizeScanResponse(result.data)
+                };
+            } catch (err) {
+                const message = err instanceof Error ? err.message : "Groq text model failed.";
+                textErrors.push({ provider: "groq", message });
+            }
+        }
+
+        // Tertiary Text Fallback: Gemini
+        if (geminiApiKey) {
+            try {
+                const result = await scanTextWithGemini(ocrText, onProgress);
+                return {
+                    mode: "ocr_text",
+                    provider: "gemini",
+                    model: result.model,
+                    data: normalizeScanResponse(result.data)
+                };
+            } catch (err) {
+                const message = err instanceof Error ? err.message : "Gemini text model failed.";
+                textErrors.push({ provider: "gemini", message });
+            }
         }
     }
 
-    throw Object.assign(new Error("Failed to scan receipt via vision models."), { providerErrors: errors });
+    // --- Step 2: If text models fail or weren't available, cascade to Vision AI models ---
+    if (images.length > 0) {
+        onProgress?.({
+            stage: "vision",
+            model: "Vision AI",
+            phase: ocrText
+                ? "Text models exhausted. Switching to Vision AI models..."
+                : `Analyzing ${images.length} page(s) with Vision AI...`
+        });
+
+        // Vision Attempt 1: OpenRouter Multimodal Models
+        if (openRouterApiKey) {
+            try {
+                const result = await scanWithOpenRouter(images, onProgress);
+                return {
+                    mode: "vision_image",
+                    provider: "openrouter",
+                    model: result.model,
+                    data: normalizeScanResponse(result.data)
+                };
+            } catch (err) {
+                const message = err instanceof Error ? err.message : "OpenRouter vision models failed.";
+                visionErrors.push({ provider: "openrouter", message });
+            }
+        }
+
+        // Vision Attempt 2: Gemini Vision
+        if (geminiApiKey) {
+            try {
+                const result = await scanWithGemini(images, onProgress);
+                return {
+                    mode: "vision_image",
+                    provider: "gemini",
+                    model: result.model,
+                    data: normalizeScanResponse(result.data)
+                };
+            } catch (err) {
+                const message = err instanceof Error ? err.message : "Gemini vision failed.";
+                visionErrors.push({ provider: "gemini", message });
+            }
+        }
+
+        // Vision Attempt 3: Groq Vision
+        if (groqApiKey) {
+            try {
+                const result = await scanWithGroq(images, onProgress);
+                return {
+                    mode: "vision_image",
+                    provider: "groq",
+                    model: result.model,
+                    data: normalizeScanResponse(result.data)
+                };
+            } catch (err) {
+                const message = err instanceof Error ? err.message : "Groq vision failed.";
+                visionErrors.push({ provider: "groq", message });
+            }
+        }
+    }
+
+    const allErrors = [...textErrors, ...visionErrors];
+    const failureReason = allErrors.length > 0
+        ? allErrors.map((e) => `${e.provider}: ${e.message}`).join(" | ")
+        : "No scanning providers succeeded.";
+
+    throw Object.assign(new Error(`Failed to scan invoice: ${failureReason}`), {
+        providerErrors: allErrors
+    });
 }
 
 // ==========================================
@@ -580,35 +659,93 @@ async function scanWithFallback(images: string[]) {
 export async function POST(request: Request) {
     try {
         const body = await request.json();
-        const { ocrText, image, images } = body;
+        const { ocrText, image, images, stream } = body;
 
-        // Path A: Fast Client OCR Text provided
-        if (typeof ocrText === "string" && ocrText.trim().length > 0) {
-            const result = await scanOCRWithFallback(ocrText.trim());
-            return NextResponse.json({
-                success: true,
-                mode: "ocr_text",
-                provider: result.provider,
-                data: result.data
-            });
-        }
-
-        // Path B: Vision Image(s) Fallback
         const imagesList: string[] = Array.isArray(images) && images.length > 0
             ? images
             : (typeof image === "string" && image.length > 0 ? [image] : []);
 
-        if (imagesList.length > 0) {
-            const result = await scanWithFallback(imagesList);
-            return NextResponse.json({
-                success: true,
-                mode: "vision_image",
-                provider: result.provider,
-                data: result.data
+        const hasOcrText = typeof ocrText === "string" && ocrText.trim().length > 0;
+
+        if (!hasOcrText && imagesList.length === 0) {
+            return NextResponse.json(
+                { success: false, error: "Neither ocrText nor images were provided." },
+                { status: 400 }
+            );
+        }
+
+        const isStream = request.headers.get("accept")?.includes("application/x-ndjson") || stream === true;
+
+        if (isStream) {
+            const encoder = new TextEncoder();
+            const customStream = new ReadableStream({
+                async start(controller) {
+                    const sendEvent = (data: unknown) => {
+                        try {
+                            controller.enqueue(encoder.encode(JSON.stringify(data) + "\n"));
+                        } catch {
+                            // Controller might be closed
+                        }
+                    };
+
+                    try {
+                        const result = await processScanPipeline(
+                            hasOcrText ? ocrText.trim() : null,
+                            imagesList,
+                            (progress) => sendEvent({ type: "progress", ...progress })
+                        );
+
+                        sendEvent({
+                            type: "complete",
+                            success: true,
+                            mode: result.mode,
+                            provider: result.provider,
+                            model: result.model,
+                            data: result.data
+                        });
+                    } catch (err: unknown) {
+                        const providerErrors = Array.isArray((err as { providerErrors?: ProviderError[] })?.providerErrors)
+                            ? (err as { providerErrors: ProviderError[] }).providerErrors
+                            : [];
+
+                        sendEvent({
+                            type: "error",
+                            success: false,
+                            error: err instanceof Error ? err.message : "Failed to scan receipt.",
+                            errors: providerErrors
+                        });
+                    } finally {
+                        try {
+                            controller.close();
+                        } catch {
+                            // Already closed
+                        }
+                    }
+                }
+            });
+
+            return new Response(customStream, {
+                headers: {
+                    "Content-Type": "application/x-ndjson",
+                    "Cache-Control": "no-cache, no-transform",
+                    "Connection": "keep-alive"
+                }
             });
         }
 
-        return NextResponse.json({ success: false, error: "Neither ocrText nor images were provided." }, { status: 400 });
+        // Standard non-streaming fallback
+        const result = await processScanPipeline(
+            hasOcrText ? ocrText.trim() : null,
+            imagesList
+        );
+
+        return NextResponse.json({
+            success: true,
+            mode: result.mode,
+            provider: result.provider,
+            model: result.model,
+            data: result.data
+        });
     } catch (error: unknown) {
         const providerErrors = Array.isArray((error as { providerErrors?: ProviderError[] })?.providerErrors)
             ? (error as { providerErrors: ProviderError[] }).providerErrors

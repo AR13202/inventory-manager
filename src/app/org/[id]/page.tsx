@@ -29,6 +29,7 @@ import {
 import { updateOrganizationProfile } from "@/utils/firebaseHelpers/orgs";
 import { escapeHtml, openPrintWindow } from "@/utils/print";
 import { compressImageForUpload } from "@/utils/imageCompressor";
+import { openNativeDatePicker } from "@/utils/nativeDatePicker";
 
 type HomeTab = "overview" | "outstanding";
 type RevenueRange = "3m" | "6m" | "12m";
@@ -732,7 +733,8 @@ export default function OrgHomePage() {
       )
       .join("");
 
-    const billRows = monthlyReportData.sortedMonthBills
+    const buildBillRows = (billsForType: BillItem[]) =>
+      billsForType
       .map((bill) => {
         const grossAmount = parseAmount(bill.grossAmount || 0);
         const taxAmount = parseAmount(bill.taxAmount || 0);
@@ -743,17 +745,26 @@ export default function OrgHomePage() {
         const mode = status === "Paid"
           ? (bill.paidType || "Cash") + (bill.chequeNumber ? ` (Chq: ${bill.chequeNumber})` : "")
           : "-";
+        const attachedPhoto = bill.photoPublicId || bill.photoUrl
+          ? {
+              publicId: bill.photoPublicId,
+              url: bill.photoUrl,
+              resourceType: bill.photoResourceType,
+            }
+          : bill.photos?.[0];
+        const billImageUrl = attachedPhoto?.publicId
+          ? `${window.location.origin}/api/bills/file?publicId=${encodeURIComponent(attachedPhoto.publicId)}&resourceType=${encodeURIComponent(attachedPhoto.resourceType || "image")}`
+          : attachedPhoto?.url;
+        const billNumber = escapeHtml(bill.billNumber || "-");
+        const billNumberCell = billImageUrl
+          ? `<a href="${escapeHtml(billImageUrl)}" target="_blank" rel="noreferrer" class="bill-link">${billNumber}</a>`
+          : `<strong>${billNumber}</strong>`;
 
         return `
           <tr>
             <td>${escapeHtml(bill.date || "")}</td>
-            <td><strong>${escapeHtml(bill.billNumber || "")}</strong></td>
+            <td>${billNumberCell}</td>
             <td>${escapeHtml(bill.vendorName || "")}</td>
-            <td>
-              <span style="font-weight: 600; color: ${bill.billType === "Sale" ? "#0284c7" : "#475569"}">
-                ${escapeHtml(bill.billType || "")}
-              </span>
-            </td>
             <td>${escapeHtml(formatCurrencyINR(grossAmount))}</td>
             <td>${escapeHtml(formatCurrencyINR(taxAmount))}</td>
             <td><strong>${escapeHtml(formatCurrencyINR(totalAmount))}</strong></td>
@@ -772,16 +783,17 @@ export default function OrgHomePage() {
       })
       .join("");
 
-    const billGrossTotal = monthlyReportData.sortedMonthBills.reduce((sum, b) => sum + parseAmount(b.grossAmount || 0), 0);
-    const billTaxTotal = monthlyReportData.sortedMonthBills.reduce((sum, b) => sum + parseAmount(b.taxAmount || 0), 0);
-    const billTotalTotal = monthlyReportData.sortedMonthBills.reduce((sum, b) => sum + parseAmount(b.amount || 0), 0);
-    const billPaidTotal = monthlyReportData.sortedMonthBills.reduce((sum, b) => sum + parseAmount(b.paymentStatus === "Paid" ? b.amount : 0), 0);
-    const billRemainingTotal = monthlyReportData.sortedMonthBills.reduce((sum, b) => sum + parseAmount(b.paymentStatus !== "Paid" ? b.amount : 0), 0);
+    const buildBillTableFooter = (billsForType: BillItem[]) => {
+      const billGrossTotal = billsForType.reduce((sum, b) => sum + parseAmount(b.grossAmount || 0), 0);
+      const billTaxTotal = billsForType.reduce((sum, b) => sum + parseAmount(b.taxAmount || 0), 0);
+      const billTotalTotal = billsForType.reduce((sum, b) => sum + parseAmount(b.amount || 0), 0);
+      const billPaidTotal = billsForType.reduce((sum, b) => sum + parseAmount(b.paymentStatus === "Paid" ? b.amount : 0), 0);
+      const billRemainingTotal = billsForType.reduce((sum, b) => sum + parseAmount(b.paymentStatus !== "Paid" ? b.amount : 0), 0);
 
-    const billTableFooter = `
+      return `
       <tfoot>
         <tr style="font-weight: bold; background: #e2e8f0;">
-          <td colspan="4" style="text-align: right; padding: 8px; border: 1px solid #cbd5e1;">Grand Total:</td>
+          <td colspan="3" style="text-align: right; padding: 8px; border: 1px solid #cbd5e1;">Grand Total:</td>
           <td style="padding: 8px; border: 1px solid #cbd5e1;">${escapeHtml(formatCurrencyINR(billGrossTotal))}</td>
           <td style="padding: 8px; border: 1px solid #cbd5e1;">${escapeHtml(formatCurrencyINR(billTaxTotal))}</td>
           <td style="padding: 8px; border: 1px solid #cbd5e1;">${escapeHtml(formatCurrencyINR(billTotalTotal))}</td>
@@ -791,6 +803,32 @@ export default function OrgHomePage() {
         </tr>
       </tfoot>
     `;
+    };
+
+    const sortBillsByDateAndNumber = (billsForType: BillItem[]) =>
+      [...billsForType].sort((first, second) => {
+        const dateComparison = String(first.date || "").localeCompare(
+          String(second.date || ""),
+        );
+        if (dateComparison !== 0) return dateComparison;
+
+        return String(first.billNumber || "").localeCompare(
+          String(second.billNumber || ""),
+          undefined,
+          { numeric: true, sensitivity: "base" },
+        );
+      });
+
+    const salesBills = sortBillsByDateAndNumber(
+      monthlyReportData.sortedMonthBills.filter((bill) => bill.billType === "Sale"),
+    );
+    const purchaseBills = sortBillsByDateAndNumber(
+      monthlyReportData.sortedMonthBills.filter(
+        (bill) => bill.billType === "Purchase",
+      ),
+    );
+    const salesBillRows = buildBillRows(salesBills);
+    const purchaseBillRows = buildBillRows(purchaseBills);
 
     const dailyRows = monthlyReportData.dailyRows
       .filter((row) => row.sales > 0 || row.purchase > 0)
@@ -902,6 +940,11 @@ export default function OrgHomePage() {
             border-radius: 4px;
             font-weight: bold;
             font-size: 9px;
+          }
+          .bill-link {
+            color: #0369a1;
+            font-weight: 700;
+            text-decoration: underline;
           }
           .page-break {
             page-break-before: always;
@@ -1063,14 +1106,13 @@ export default function OrgHomePage() {
         </div>
         
         <div class="section">
-          <h2>All Monthly Bills</h2>
+          <h2>Sales Bills</h2>
           <table class="report-table">
             <thead>
               <tr>
                 <th>Date</th>
                 <th>Bill Number</th>
                 <th>Company Name</th>
-                <th>Type</th>
                 <th>Gross Amount</th>
                 <th>Tax Amount</th>
                 <th>Total Amount</th>
@@ -1081,9 +1123,33 @@ export default function OrgHomePage() {
               </tr>
             </thead>
             <tbody>
-              ${billRows || '<tr><td colspan="11" style="text-align: center; padding: 20px; color: #64748b;">No bills found for this month.</td></tr>'}
+              ${salesBillRows || '<tr><td colspan="10" style="text-align: center; padding: 20px; color: #64748b;">No sales bills found for this month.</td></tr>'}
             </tbody>
-            ${billRows ? billTableFooter : ""}
+            ${salesBillRows ? buildBillTableFooter(salesBills) : ""}
+          </table>
+        </div>
+
+        <div class="section" style="margin-top: 24px;">
+          <h2>Purchase Bills</h2>
+          <table class="report-table">
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Bill Number</th>
+                <th>Company Name</th>
+                <th>Gross Amount</th>
+                <th>Tax Amount</th>
+                <th>Total Amount</th>
+                <th>Status</th>
+                <th>Payment Mode</th>
+                <th>Paid Amount</th>
+                <th>Remaining Amount</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${purchaseBillRows || '<tr><td colspan="10" style="text-align: center; padding: 20px; color: #64748b;">No purchase bills found for this month.</td></tr>'}
+            </tbody>
+            ${purchaseBillRows ? buildBillTableFooter(purchaseBills) : ""}
           </table>
         </div>
 
@@ -1872,6 +1938,7 @@ export default function OrgHomePage() {
                 className="input-field"
                 type="month"
                 value={reportMonth}
+                onClick={openNativeDatePicker}
                 onChange={(e) => setReportMonth(e.target.value)}
                 style={{ width: "100%", padding: "12px", fontSize: "1rem" }}
               />

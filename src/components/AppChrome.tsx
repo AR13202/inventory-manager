@@ -3,9 +3,9 @@
 import Link from "next/link";
 import { createContext, useContext, useMemo, useState, type Dispatch, type SetStateAction } from "react";
 import { usePathname } from "next/navigation";
-import { Menu, Moon, Sun, X } from "lucide-react";
+import { Home, Menu, Moon, Sun, X } from "lucide-react";
 import { AuthProvider } from "@/context/AuthContext";
-import { OrgProvider } from "@/context/OrgContext";
+import { OrgProvider, useOrg } from "@/context/OrgContext";
 import { ThemeProvider, useTheme } from "@/context/ThemeContext";
 
 type OrgMobileNavContextValue = {
@@ -29,7 +29,13 @@ function AppHeader({ children }: { children: React.ReactNode }) {
     const { theme, setTheme } = useTheme();
     const pathname = usePathname();
     const { mobileSidebarOpen, setMobileSidebarOpen } = useOrgMobileNav();
+    const { activeOrg } = useOrg();
     const showOrgMenu = pathname.startsWith("/org/");
+
+    const routeOrgMatch = pathname.match(/^\/org\/([^/]+)/);
+    const currentOrgId = routeOrgMatch ? routeOrgMatch[1] : (activeOrg?.orgId ? encodeURIComponent(activeOrg.orgId) : null);
+    const orgHomeHref = currentOrgId ? `/org/${currentOrgId}` : null;
+    const isHomeActive = Boolean(orgHomeHref && (pathname === orgHomeHref || pathname === `${orgHomeHref}/`));
 
     return (
         <>
@@ -55,13 +61,29 @@ function AppHeader({ children }: { children: React.ReactNode }) {
                     InvPro
                 </div>
                 <div className="nav-links">
-                    <Link href="/" className="nav-link">Dashboard</Link>
+                    <Link
+                        href="/"
+                        className={`nav-link ${showOrgMenu ? "org-dashboard-nav-link" : ""}`}
+                    >
+                        Dashboard
+                    </Link>
+                    {showOrgMenu && orgHomeHref && (
+                        <Link
+                            href={orgHomeHref}
+                            className={`org-mobile-home-btn ${isHomeActive ? "active" : ""}`}
+                            aria-label="Organization home"
+                            title="Organization home"
+                            onClick={() => setMobileSidebarOpen(false)}
+                        >
+                            <Home size={18} />
+                        </Link>
+                    )}
                     <div className="theme-toggle" role="group" aria-label="Theme selector">
-                        <button type="button" className={`theme-toggle-btn ${theme === "light" ? "active" : ""}`} onClick={() => setTheme("light")}>
-                            <Sun size={16} /> Light
+                        <button type="button" aria-label="Use light theme" className={`theme-toggle-btn ${theme === "light" ? "active" : ""}`} onClick={() => setTheme("light")}>
+                            <Sun size={16} /> <span className="theme-toggle-label">Light</span>
                         </button>
-                        <button type="button" className={`theme-toggle-btn ${theme === "dark" ? "active" : ""}`} onClick={() => setTheme("dark")}>
-                            <Moon size={16} /> Dark
+                        <button type="button" aria-label="Use dark theme" className={`theme-toggle-btn ${theme === "dark" ? "active" : ""}`} onClick={() => setTheme("dark")}>
+                            <Moon size={16} /> <span className="theme-toggle-label">Dark</span>
                         </button>
                     </div>
                 </div>

@@ -38,6 +38,8 @@ export interface ScannedReceiptData {
         price?: number;
         category?: string;
     }[];
+    modelUsed?: string;
+    scanProvider?: string;
 }
 
 export interface ScanProviderError {
@@ -45,20 +47,82 @@ export interface ScanProviderError {
     message: string;
 }
 
-export type ScanProgressCallback = (phase: string) => void;
+export type ScanProgressCallback = (phase: string, currentModel?: string) => void;
 
 /**
  * Sends either OCR text or an image/images payload to the server-side extraction API
+ * Reads streaming NDJSON events so the active model is reported in real time.
  */
-async function callScanApi(payload: { ocrText?: string; image?: string; images?: string[] }) {
+async function callScanApi(
+    payload: { ocrText?: string; image?: string; images?: string[] },
+    onProgress?: ScanProgressCallback
+): Promise<ScannedReceiptData> {
     const response = await fetch("/api/bills/scan", {
         method: "POST",
         headers: {
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            "Accept": "application/x-ndjson, application/json"
         },
-        body: JSON.stringify(payload)
+        body: JSON.stringify({ ...payload, stream: true })
     });
 
+    const contentType = response.headers.get("content-type") || "";
+
+    if (contentType.includes("application/x-ndjson") && response.body) {
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let finalData: ScannedReceiptData | null = null;
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop() || "";
+
+            for (const line of lines) {
+                const trimmed = line.trim();
+                if (!trimmed) continue;
+
+                try {
+                    const event = JSON.parse(trimmed);
+
+                    if (event.type === "progress") {
+                        onProgress?.(event.phase || "Extracting invoice data...", event.model);
+                    } else if (event.type === "complete") {
+                        finalData = {
+                            ...(event.data || {}),
+                            modelUsed: event.model,
+                            scanProvider: event.provider
+                        };
+                    } else if (event.type === "error") {
+                        const providerErrors = Array.isArray(event.errors)
+                            ? (event.errors as ScanProviderError[])
+                                .map((entry) => `${String(entry.provider || "provider")}: ${String(entry.message || "Unknown error")}`)
+                                .join(" | ")
+                            : "";
+                        const errorMsg = providerErrors
+                            ? `${event.error || "Failed to scan receipt."} ${providerErrors}`
+                            : (event.error || "Failed to scan receipt.");
+                        throw new Error(errorMsg);
+                    }
+                } catch (parseErr) {
+                    if (parseErr instanceof Error && parseErr.message.includes("Failed to scan receipt")) {
+                        throw parseErr;
+                    }
+                }
+            }
+        }
+
+        if (finalData) {
+            return finalData;
+        }
+        throw new Error("Scan stream ended without receipt data.");
+    }
+
+    // Standard JSON fallback
     const data = await response.json();
     if (!response.ok || !data.success) {
         const providerErrors = Array.isArray(data.errors)
@@ -72,7 +136,11 @@ async function callScanApi(payload: { ocrText?: string; image?: string; images?:
         throw new Error(errorMessage);
     }
 
-    return data.data as ScannedReceiptData;
+    return {
+        ...(data.data as ScannedReceiptData),
+        modelUsed: data.model,
+        scanProvider: data.provider
+    };
 }
 
 /**
@@ -102,8 +170,11 @@ export async function scanReceipt(
 
     // If PDF or non-browser environment, route directly to Vision / Server API
     if (!isBrowser || hasPdf) {
-        onProgress?.(totalPages > 1 ? `Analyzing ${totalPages} invoice pages with Vision AI...` : "Analyzing document with Vision AI...");
-        return callScanApi({ images: fileList });
+        onProgress?.(
+            totalPages > 1 ? `Analyzing ${totalPages} invoice pages with Vision AI...` : "Analyzing document with Vision AI...",
+            "Vision AI"
+        );
+        return callScanApi({ images: fileList }, onProgress);
     }
 
     try {
@@ -115,7 +186,7 @@ export async function scanReceipt(
             const pagePrefix = totalPages > 1 ? `Page ${i + 1}/${totalPages}: ` : "";
 
             // --- Step 1: Preprocess Image (Pass 1: Illumination Normalization @ 2600px 300 DPI) ---
-            onProgress?.(`${pagePrefix}Removing shadows & preparing scan...`);
+            onProgress?.(`${pagePrefix}Removing shadows & preparing scan...`, "Canvas Preprocessor");
             const preprocessedDataUrl = await preprocessImage(fileDataUrl, {
                 maxDimension: 2600,
                 mode: "illumination-normalized",
@@ -124,12 +195,12 @@ export async function scanReceipt(
             });
 
             // --- Step 2: Client-side Web Worker OCR (Pass 1) ---
-            onProgress?.(`${pagePrefix}Scanning page text...`);
+            onProgress?.(`${pagePrefix}Scanning page text...`, "Tesseract OCR");
             const pass1 = await runOCR(preprocessedDataUrl, {
                 psm: "4",
                 onProgress: (progress) => {
                     const pct = Math.min(99, Math.round(progress * 100));
-                    onProgress?.(`${pagePrefix}Reading text (${pct}%)`);
+                    onProgress?.(`${pagePrefix}Reading text (${pct}%)`, "Tesseract OCR");
                 }
             });
 
@@ -141,7 +212,7 @@ export async function scanReceipt(
 
             // --- Step 4: Intelligent Second Pass if needed ---
             if (quality1.recommendation === "retry_with_binarization") {
-                onProgress?.(`${pagePrefix}Enhancing fine text & contrast...`);
+                onProgress?.(`${pagePrefix}Enhancing fine text & contrast...`, "Adaptive OCR Filter");
                 const adaptiveDataUrl = await preprocessImage(fileDataUrl, {
                     maxDimension: 2600,
                     mode: "local-adaptive",
@@ -152,7 +223,7 @@ export async function scanReceipt(
                     psm: "6",
                     onProgress: (progress) => {
                         const pct = Math.min(99, Math.round(progress * 100));
-                        onProgress?.(`${pagePrefix}Re-reading text (${pct}%)`);
+                        onProgress?.(`${pagePrefix}Re-reading text (${pct}%)`, "Tesseract OCR (Pass 2)");
                     }
                 });
 
@@ -181,16 +252,19 @@ export async function scanReceipt(
         const combinedText = pageTexts.join("\n\n").trim();
 
         if (needsVisionFallback || !combinedText || combinedText.length < 20) {
-            onProgress?.(`Interpreting ${totalPages} pages with Vision AI...`);
-            return callScanApi({ images: fileList });
+            onProgress?.(`Interpreting ${totalPages} pages with Vision AI...`, "Vision AI");
+            return callScanApi({ images: fileList }, onProgress);
         }
 
-        onProgress?.(totalPages > 1 ? `Extracting data from ${totalPages} pages...` : "Understanding bill...");
-        return await callScanApi({ ocrText: combinedText });
+        onProgress?.(
+            totalPages > 1 ? `Extracting data from ${totalPages} pages...` : "Extracting invoice data...",
+            "llama-3.3-70b-versatile (Groq)"
+        );
+        return await callScanApi({ ocrText: combinedText, images: fileList }, onProgress);
 
     } catch (clientOcrError) {
         console.warn("[OCR Multi-page Pipeline Warning] Falling back to Vision AI:", clientOcrError);
-        onProgress?.(`Interpreting with Vision AI...`);
-        return callScanApi({ images: fileList });
+        onProgress?.(`Interpreting with Vision AI...`, "Vision AI");
+        return callScanApi({ images: fileList }, onProgress);
     }
 }

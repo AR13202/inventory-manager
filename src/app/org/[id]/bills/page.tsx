@@ -292,6 +292,7 @@ export default function BillsPage() {
             .slice(0, 6);
     }, [companies, form.vendorName]);
     const showListPanel = !showForm && !selected;
+    const hideMobileAddButton = !showListPanel || showMobileFilters;
 
     const openMobileFilters = () => {
         setPendingBillFilter(billFilter);
@@ -980,7 +981,7 @@ export default function BillsPage() {
                         <h1 className="dashboard-title">Bills & Receipts</h1>
                         <button
                             type="button"
-                            className={`btn-primary bills-page-mobile-action ${showMobileFilters ? "is-hidden" : ""}`}
+                            className={`btn-primary bills-page-mobile-action ${hideMobileAddButton ? "is-hidden" : ""}`}
                             aria-label="Add bill"
                             title="Add bill"
                             onClick={openNew}

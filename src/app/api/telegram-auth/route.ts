@@ -2,8 +2,8 @@ import { NextRequest, NextResponse } from "next/server";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const FIREBASE_API_KEY = (process.env.apiKey || process.env.FIREBASE_API_KEY)!;
-const FIREBASE_PROJECT_ID = (process.env.projectId || process.env.FIREBASE_PROJECT_ID)!;
+const FIREBASE_API_KEY = (process.env.NEXT_PUBLIC_apiKey || process.env.FIREBASE_API_KEY)!;
+const FIREBASE_PROJECT_ID = (process.env.NEXT_PUBLIC_projectId || process.env.FIREBASE_PROJECT_ID)!;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN!;
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 

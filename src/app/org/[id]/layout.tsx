@@ -6,7 +6,7 @@ import { useOrgMobileNav } from "@/components/AppChrome";
 import { useRouter } from "next/navigation";
 import React, { useEffect } from "react";
 import Link from "next/link";
-import { Users, Box, Home, FileText } from "lucide-react";
+import { Users, Box, Home, FileText, LayoutDashboard } from "lucide-react";
 
 export default function OrgLayout({
     children,
@@ -65,7 +65,7 @@ export default function OrgLayout({
     const closeMobileSidebar = () => setMobileSidebarOpen(false);
 
     return (
-        <div className="org-shell" style={{ display: 'flex', minHeight: 'calc(100vh - 67px)' }}>
+        <div className="org-shell">
             {mobileSidebarOpen && (
                 <button
                     type="button"
@@ -78,7 +78,7 @@ export default function OrgLayout({
             {/* Sidebar specific to the organization */}
             <aside
                 className={`org-sidebar ${mobileSidebarOpen ? "open" : ""}`}
-                style={{ width: '250px', borderRight: '1px solid var(--border-color)', background: 'var(--glass-bg)', padding: '24px 16px' }}
+                style={{ padding: '24px 16px' }}
             >
                 <div style={{ marginBottom: '32px', padding: '0 12px' }}>
                     {activeOrg.logoPublicId && (
@@ -94,6 +94,9 @@ export default function OrgLayout({
                 </div>
 
                 <nav style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                    <Link href="/" style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '12px', borderRadius: '8px', transition: 'var(--transition)' }} className="table-row-hover org-dashboard-sidebar-link" onClick={closeMobileSidebar}>
+                        <LayoutDashboard size={18} /> Dashboard
+                    </Link>
                     <Link href={`/org/${activeOrg.orgId}`} style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '12px', borderRadius: '8px', transition: 'var(--transition)' }} className="table-row-hover" onClick={closeMobileSidebar}>
                         <Home size={18} /> Home
                     </Link>
@@ -113,7 +116,7 @@ export default function OrgLayout({
             </aside>
 
             {/* Main Content Area */}
-            <div className="org-shell-content" style={{ flex: 1, padding: '32px 48px', overflowY: 'auto' }}>
+            <div className="org-shell-content">
                 {children}
             </div>
         </div>

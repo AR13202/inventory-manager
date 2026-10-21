@@ -1,8 +1,9 @@
 "use client";
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { Virtuoso } from "react-virtuoso";
 import { useSearchParams } from "next/navigation";
-import { ArrowLeft, Edit, FileText, Filter, Plus, Search, Sparkles, Trash2, Upload, X } from "lucide-react";
+import { ArrowLeft, CheckCircle2, Cpu, Edit, FileText, Filter, Plus, Search, SlidersHorizontal, Sparkles, Trash2, Upload, X } from "lucide-react";
 import { useAuth } from "@/context/AuthContext";
 import { useOrg } from "@/context/OrgContext";
 import { addBillItem, BillItem, BillTaxDetail, deleteBillItem, subscribeToBills, updateBillItem } from "@/utils/firebaseHelpers/bills";
@@ -21,6 +22,7 @@ import { createBillNumber, getBillAssetUrl, normalizeBillType, sanitizeBillNumbe
 import { formatCurrencyINR } from "@/utils/formatters";
 import { scanReceipt } from "@/utils/geminiScanner";
 import { compressImageForUpload } from "@/utils/imageCompressor";
+import { openNativeDatePicker } from "@/utils/nativeDatePicker";
 
 type FormState = Partial<BillItem> & { vendorGst?: string; vendorAddress?: string; vendorPhone?: string };
 type BillFilter = "All" | "Purchase" | "Sale";
@@ -104,6 +106,32 @@ const DEFAULT_TAX_RATES: Record<string, string> = {
     "Tax": "18"
 };
 
+const getTaxableAmount = (
+    products: BillItem["products"] | undefined,
+    freightValue: string | number | undefined,
+) =>
+    (products || []).reduce(
+        (sum, product) =>
+            sum + parseNumericValue(product.quantity) * parseNumericValue(product.price),
+        0,
+    ) + parseNumericValue(freightValue);
+
+const recalculateTaxDetails = (
+    taxDetails: BillTaxDetail[] | undefined,
+    taxableAmount: number,
+) =>
+    (taxDetails || []).map((tax) => {
+        const percentage = parseNumericValue(tax.taxPercentage);
+        return percentage > 0
+            ? {
+                ...tax,
+                taxAmount: toFormNumber(
+                    Number(((taxableAmount * percentage) / 100).toFixed(2)),
+                ),
+            }
+            : tax;
+    });
+
 const calculateAutoRoundOff = (grossAmount: number, taxAmount: number, freightValue: string | number | undefined) => {
     const rawSubtotal = grossAmount + taxAmount + parseNumericValue(freightValue);
     const rounded = Math.round(rawSubtotal);
@@ -157,6 +185,11 @@ export default function BillsPage() {
     const [billSort, setBillSort] = useState<BillSort>("dateDesc");
     const [fromDate, setFromDate] = useState("");
     const [toDate, setToDate] = useState("");
+    const [showMobileFilters, setShowMobileFilters] = useState(false);
+    const [pendingBillFilter, setPendingBillFilter] = useState<BillFilter>("All");
+    const [pendingBillSort, setPendingBillSort] = useState<BillSort>("dateDesc");
+    const [pendingFromDate, setPendingFromDate] = useState("");
+    const [pendingToDate, setPendingToDate] = useState("");
     const [editingId, setEditingId] = useState<string | null>(null);
     const [selectedId, setSelectedId] = useState<string | null>(null);
     const [showForm, setShowForm] = useState(searchParams.get("mode") === "new");
@@ -168,6 +201,8 @@ export default function BillsPage() {
     const [busy, setBusy] = useState(false);
     const [scanning, setScanning] = useState(false);
     const [scanProgress, setScanProgress] = useState("");
+    const [currentModel, setCurrentModel] = useState("");
+    const [scannedModel, setScannedModel] = useState("");
     const [showCompanySuggestions, setShowCompanySuggestions] = useState(false);
 
     useEffect(() => {
@@ -227,7 +262,15 @@ export default function BillsPage() {
             if (billSort === "dateAsc" || billSort === "dateDesc") {
                 const aTime = a.date ? new Date(a.date).getTime() : 0;
                 const bTime = b.date ? new Date(b.date).getTime() : 0;
-                return billSort === "dateAsc" ? aTime - bTime : bTime - aTime;
+                const dateComparison = billSort === "dateAsc" ? aTime - bTime : bTime - aTime;
+                if (dateComparison !== 0) return dateComparison;
+
+                const billNumberComparison = String(a.billNumber || a.id || "").localeCompare(
+                    String(b.billNumber || b.id || ""),
+                    undefined,
+                    { numeric: true, sensitivity: "base" },
+                );
+                return billSort === "dateAsc" ? billNumberComparison : -billNumberComparison;
             }
 
             if (billSort === "billNumber") {
@@ -249,6 +292,33 @@ export default function BillsPage() {
             .slice(0, 6);
     }, [companies, form.vendorName]);
     const showListPanel = !showForm && !selected;
+
+    const openMobileFilters = () => {
+        setPendingBillFilter(billFilter);
+        setPendingBillSort(billSort);
+        setPendingFromDate(fromDate);
+        setPendingToDate(toDate);
+        setShowMobileFilters(true);
+    };
+
+    const applyMobileFilters = () => {
+        setBillFilter(pendingBillFilter);
+        setBillSort(pendingBillSort);
+        setFromDate(pendingFromDate);
+        setToDate(pendingToDate);
+        setShowMobileFilters(false);
+    };
+
+    const clearMobileFilters = () => {
+        setPendingBillFilter("All");
+        setPendingBillSort("dateDesc");
+        setPendingFromDate("");
+        setPendingToDate("");
+        setBillFilter("All");
+        setBillSort("dateDesc");
+        setFromDate("");
+        setToDate("");
+    };
 
     const openNew = () => {
         setEditingId(null);
@@ -330,18 +400,9 @@ export default function BillsPage() {
             }
         }
         
-        // Re-calculate tax amounts automatically based on new gross amount
-        const newGross = products.reduce((s, p) => s + parseNumericValue(p.quantity) * parseNumericValue(p.price), 0);
-        const updatedTaxDetails = (form.taxDetails || []).map((t) => {
-            const pct = parseNumericValue(t.taxPercentage);
-            if (pct > 0) {
-                return {
-                    ...t,
-                    taxAmount: toFormNumber(Number(((newGross * pct) / 100).toFixed(2)))
-                };
-            }
-            return t;
-        });
+        // Freight is part of the taxable value, together with product totals.
+        const taxableAmount = getTaxableAmount(products, form.freightAndForwardingCharges);
+        const updatedTaxDetails = recalculateTaxDetails(form.taxDetails, taxableAmount);
 
         setForm((current) => {
             const updated = { ...current, products, taxDetails: updatedTaxDetails };
@@ -352,9 +413,9 @@ export default function BillsPage() {
     const setTaxType = (index: number, taxType: string) => {
         const taxDetails = [...(form.taxDetails || [])];
         const defaultRate = DEFAULT_TAX_RATES[taxType] !== undefined ? DEFAULT_TAX_RATES[taxType] : (taxDetails[index]?.taxPercentage || "9");
-        const gross = (form.products || []).reduce((s, p) => s + parseNumericValue(p.quantity) * parseNumericValue(p.price), 0);
+        const taxableAmount = getTaxableAmount(form.products, form.freightAndForwardingCharges);
         const pctVal = parseNumericValue(defaultRate);
-        const calcAmount = gross > 0 && pctVal > 0 ? toFormNumber(Number(((gross * pctVal) / 100).toFixed(2))) : toFormNumber(taxDetails[index]?.taxAmount);
+        const calcAmount = taxableAmount > 0 && pctVal > 0 ? toFormNumber(Number(((taxableAmount * pctVal) / 100).toFixed(2))) : toFormNumber(taxDetails[index]?.taxAmount);
 
         taxDetails[index] = {
             ...taxDetails[index],
@@ -372,9 +433,9 @@ export default function BillsPage() {
     const setTaxPercentage = (index: number, taxPercentage: string) => {
         if (!isValidNumericInput(taxPercentage)) return;
         const taxDetails = [...(form.taxDetails || [])];
-        const gross = (form.products || []).reduce((s, p) => s + parseNumericValue(p.quantity) * parseNumericValue(p.price), 0);
+        const taxableAmount = getTaxableAmount(form.products, form.freightAndForwardingCharges);
         const pctVal = parseNumericValue(taxPercentage);
-        const calcAmount = gross > 0 && pctVal > 0 ? toFormNumber(Number(((gross * pctVal) / 100).toFixed(2))) : (taxPercentage === "" ? "0" : toFormNumber(taxDetails[index]?.taxAmount));
+        const calcAmount = taxableAmount > 0 && pctVal > 0 ? toFormNumber(Number(((taxableAmount * pctVal) / 100).toFixed(2))) : (taxPercentage === "" ? "0" : toFormNumber(taxDetails[index]?.taxAmount));
 
         taxDetails[index] = {
             ...taxDetails[index],
@@ -416,9 +477,9 @@ export default function BillsPage() {
             nextRate = "18";
         }
 
-        const gross = (form.products || []).reduce((s, p) => s + parseNumericValue(p.quantity) * parseNumericValue(p.price), 0);
+        const taxableAmount = getTaxableAmount(form.products, form.freightAndForwardingCharges);
         const pctVal = parseNumericValue(nextRate);
-        const calcAmount = gross > 0 && pctVal > 0 ? toFormNumber(Number(((gross * pctVal) / 100).toFixed(2))) : "0";
+        const calcAmount = taxableAmount > 0 && pctVal > 0 ? toFormNumber(Number(((taxableAmount * pctVal) / 100).toFixed(2))) : "0";
 
         const newRow: BillTaxDetail = {
             taxType: nextType,
@@ -466,7 +527,18 @@ export default function BillsPage() {
     const setFormNumericField = (field: "freightAndForwardingCharges" | "roundOff", value: string, allowNegative = false) => {
         if (!isValidNumericInput(value, allowNegative)) return;
         setForm((current) => {
-            const next = { ...current, [field]: value };
+            const next = {
+                ...current,
+                [field]: value,
+                ...(field === "freightAndForwardingCharges"
+                    ? {
+                        taxDetails: recalculateTaxDetails(
+                            current.taxDetails,
+                            getTaxableAmount(current.products, value),
+                        ),
+                    }
+                    : {}),
+            };
             const isRoundOffManual = field === "roundOff";
             return { ...next, ...recalc(next, { autoRoundOff: !isRoundOffManual }) };
         });
@@ -522,14 +594,21 @@ export default function BillsPage() {
         }
 
         setScanning(true);
+        setCurrentModel("");
+        setScannedModel("");
         setScanProgress(photos.length > 1 ? `Starting multi-page scan (${photos.length} pages)...` : "Preparing image...");
         setError("");
 
         try {
             const urls = photos.map((p) => p.url);
-            const parsed = await scanReceipt(urls, (phase) => {
+            const parsed = await scanReceipt(urls, (phase, model) => {
                 setScanProgress(phase);
+                if (model) setCurrentModel(model);
             });
+
+            if (parsed.modelUsed) {
+                setScannedModel(parsed.modelUsed);
+            }
 
             const billType = parsed.billType === "Unknown" ? normalizeBillType(form.billType) : normalizeBillType(parsed.billType);
             const company = billType === "Purchase" ? parsed.parentCompanyDetails : parsed.customerCompanyDetails;
@@ -575,6 +654,7 @@ export default function BillsPage() {
         } finally {
             setScanning(false);
             setScanProgress("");
+            setCurrentModel("");
         }
     };
 
@@ -892,21 +972,32 @@ export default function BillsPage() {
     };
 
     return (
-        <div>
-            <header className="dashboard-header flex-between" style={{ marginTop: 0 }}>
+        <div className="bills-page-shell">
+            <header className="dashboard-header flex-between bills-page-header" style={{ marginTop: 0 }}>
                 <div>
                     <p className="section-kicker">Bills Workspace</p>
-                    <h1 className="dashboard-title">Bills & Receipts</h1>
+                    <div className="bills-page-title-row">
+                        <h1 className="dashboard-title">Bills & Receipts</h1>
+                        <button
+                            type="button"
+                            className={`btn-primary bills-page-mobile-action ${showMobileFilters ? "is-hidden" : ""}`}
+                            aria-label="Add bill"
+                            title="Add bill"
+                            onClick={openNew}
+                        >
+                            <Plus size={24} />
+                        </button>
+                    </div>
                     <p className="dashboard-subtitle">Track sales and purchases with cleaner list, detail, and payment flows.</p>
                 </div>
-                <button className="btn-primary" onClick={openNew}><Plus size={18} style={{ marginRight: "8px" }} /> Add Bill</button>
+                <button className="btn-primary bills-page-desktop-action" onClick={openNew}><Plus size={18} style={{ marginRight: "8px" }} /> Add Bill</button>
             </header>
 
             {error && <div className="error-banner" style={{ marginBottom: "16px" }}>{error}</div>}
 
             {showListPanel ? (
                 <div style={{ display: "grid", gap: "18px" }}>
-                    <div className="grid-dashboard" style={{ marginTop: 0 }}>
+                    <div className="grid-dashboard bills-entry-summary" style={{ marginTop: 0 }}>
                         <div className="glass-panel stat-card">
                             <span className="stat-title">Purchase Bills</span>
                             <span className="stat-value">{purchaseCount}</span>
@@ -919,12 +1010,18 @@ export default function BillsPage() {
                         </div>
                     </div>
 
-                    <section className="glass-panel" style={{ padding: 0, overflow: "hidden" }}>
-                            <div style={{ padding: "18px", borderBottom: "1px solid var(--border-color)", display: "grid", gap: "14px" }}>
-                            <div className="search-box">
-                                <Search size={16} />
-                                <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search by bill number, company, or amount..." />
+                    <section className="glass-panel bills-list-section" style={{ padding: 0 }}>
+                            <div className="bills-search-header" style={{ padding: "18px", borderBottom: "1px solid var(--border-color)", display: "grid", gap: "14px" }}>
+                            <div className="bills-search-row">
+                                <div className="search-box">
+                                    <Search size={16} />
+                                    <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search by bill number, company, or amount..." />
+                                </div>
+                                <button type="button" className="bills-mobile-filter-button" aria-label="Open bill filters and sorting" onClick={openMobileFilters}>
+                                    <SlidersHorizontal size={18} />
+                                </button>
                             </div>
+                            <div className="bills-desktop-filter-controls">
                             <div className="workspace-toolbar">
                                 <div className="workspace-filter-pill">
                                     <Filter size={16} />
@@ -953,20 +1050,26 @@ export default function BillsPage() {
                             <div style={{ display: "flex", gap: "12px", alignItems: "flex-end", flexWrap: "wrap", borderTop: "1px solid var(--border-color)", paddingTop: "12px" }}>
                                 <div style={{ minWidth: "140px", flex: 1 }}>
                                     <label className="section-label">From Date</label>
-                                    <input type="date" className="input-field" value={fromDate} onChange={(e) => setFromDate(e.target.value)} />
+                                    <input type="date" className="input-field" value={fromDate} onClick={openNativeDatePicker} onChange={(e) => setFromDate(e.target.value)} />
                                 </div>
                                 <div style={{ minWidth: "140px", flex: 1 }}>
                                     <label className="section-label">To Date</label>
-                                    <input type="date" className="input-field" value={toDate} onChange={(e) => setToDate(e.target.value)} />
+                                    <input type="date" className="input-field" value={toDate} onClick={openNativeDatePicker} onChange={(e) => setToDate(e.target.value)} />
                                 </div>
                                 {(fromDate || toDate) && (
                                     <button type="button" className="btn-secondary" onClick={() => { setFromDate(""); setToDate(""); }} style={{ height: "38px" }}>Clear Dates</button>
                                 )}
                             </div>
+                            </div>
                         </div>
-                        <div style={{ maxHeight: "72vh", overflowY: "auto" }}>
-                            {loading ? <div style={{ padding: "24px" }}>Loading bills...</div> : filtered.length === 0 ? <div style={{ padding: "24px", opacity: 0.7 }}>No bills found.</div> : filtered.map((bill) => (
-                                <button key={bill.id} type="button" className="workspace-list-row" onClick={() => openSelected(bill.id || null)}>
+                        <div className="bills-virtual-list">
+                            {loading ? <div style={{ padding: "24px" }}>Loading bills...</div> : filtered.length === 0 ? <div style={{ padding: "24px", opacity: 0.7 }}>No bills found.</div> : (
+                            <Virtuoso
+                                useWindowScroll
+                                data={filtered}
+                                overscan={400}
+                                itemContent={(_, bill) => (
+                                <button type="button" className="workspace-list-row" onClick={() => openSelected(bill.id || null)}>
                                     <div>
                                         <div style={{ fontWeight: 700 }}>{bill.billNumber || bill.id}</div>
                                         <div style={{ opacity: 0.76 }}>{bill.vendorName}</div>
@@ -979,9 +1082,60 @@ export default function BillsPage() {
                                         <div style={{ marginTop: "8px", fontWeight: 700 }}>{formatCurrencyINR(bill.amount)}</div>
                                     </div>
                                 </button>
-                            ))}
+                                )}
+                            />
+                            )}
                         </div>
                     </section>
+
+                    {showMobileFilters && (
+                        <div className="bills-mobile-filter-modal" role="dialog" aria-modal="true" aria-label="Filter and sort bills">
+                            <button type="button" className="bills-mobile-filter-backdrop" aria-label="Close filters" onClick={() => setShowMobileFilters(false)} />
+                            <div className="bills-mobile-filter-sheet">
+                                <div className="bills-mobile-filter-handle" />
+                                <div className="bills-mobile-filter-heading">
+                                    <h2>Sort & Filter</h2>
+                                    <button type="button" className="panel-icon-btn" aria-label="Close filters" onClick={() => setShowMobileFilters(false)}><X size={18} /></button>
+                                </div>
+
+                                <div className="bills-mobile-filter-group">
+                                    <label className="section-label">Bill Type</label>
+                                    <div className="workspace-filter-pill">
+                                        <Filter size={16} />
+                                        {(["All", "Purchase", "Sale"] as BillFilter[]).map((option) => (
+                                            <button key={option} type="button" className={`company-tab ${pendingBillFilter === option ? "active" : ""}`} onClick={() => setPendingBillFilter(option)}>{option}</button>
+                                        ))}
+                                    </div>
+                                </div>
+
+                                <div className="bills-mobile-filter-group">
+                                    <label className="section-label" htmlFor="mobile-bill-sort">Sort By</label>
+                                    <select id="mobile-bill-sort" className="input-field" value={pendingBillSort} onChange={(e) => setPendingBillSort(e.target.value as BillSort)}>
+                                        <option value="dateDesc">Date: Newest first</option>
+                                        <option value="dateAsc">Date: Oldest first</option>
+                                        <option value="billNumber">Bill Number</option>
+                                        <option value="companyName">Company Name</option>
+                                    </select>
+                                </div>
+
+                                <div className="bills-mobile-date-grid">
+                                    <div>
+                                        <label className="section-label">From Date</label>
+                                        <input type="date" className="input-field" value={pendingFromDate} onClick={openNativeDatePicker} onChange={(e) => setPendingFromDate(e.target.value)} />
+                                    </div>
+                                    <div>
+                                        <label className="section-label">To Date</label>
+                                        <input type="date" className="input-field" value={pendingToDate} onClick={openNativeDatePicker} onChange={(e) => setPendingToDate(e.target.value)} />
+                                    </div>
+                                </div>
+
+                                <div className="bills-mobile-filter-actions">
+                                    <button type="button" className="btn-secondary" onClick={clearMobileFilters}>Clear</button>
+                                    <button type="button" className="btn-primary" onClick={applyMobileFilters}>Apply</button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
                 </div>
             ) : (
                 <section className="glass-panel workspace-detail-panel">
@@ -1024,9 +1178,67 @@ export default function BillsPage() {
                                     </div>
                                 </div>
                                 {scanning && (
-                                    <div style={{ marginTop: "12px", padding: "10px 14px", background: "rgba(37, 99, 235, 0.12)", border: "1px solid rgba(37, 99, 235, 0.3)", borderRadius: "8px", fontSize: "0.875rem", color: "var(--primary-color)", display: "flex", alignItems: "center", gap: "10px" }}>
-                                        <div className="spinner-small" style={{ width: "16px", height: "16px", border: "2px solid var(--primary-color)", borderTopColor: "transparent", borderRadius: "50%", animation: "spin 0.8s linear infinite", flexShrink: 0 }} />
-                                        <span style={{ fontWeight: 500 }}>{scanProgress || "Processing multi-page invoice..."}</span>
+                                    <div style={{
+                                        marginTop: "12px",
+                                        padding: "12px 16px",
+                                        background: "rgba(37, 99, 235, 0.08)",
+                                        border: "1px solid rgba(37, 99, 235, 0.25)",
+                                        borderRadius: "10px",
+                                        fontSize: "0.875rem",
+                                        display: "flex",
+                                        flexDirection: "column",
+                                        gap: "8px"
+                                    }}>
+                                        <div style={{ display: "flex", alignItems: "center", gap: "10px", color: "var(--primary-color)" }}>
+                                            <div className="spinner-small" style={{ width: "16px", height: "16px", border: "2px solid var(--primary-color)", borderTopColor: "transparent", borderRadius: "50%", animation: "spin 0.8s linear infinite", flexShrink: 0 }} />
+                                            <span style={{ fontWeight: 600 }}>{scanProgress || "Processing multi-page invoice..."}</span>
+                                        </div>
+                                        {currentModel && (
+                                            <div style={{ display: "flex", alignItems: "center", gap: "6px", fontSize: "0.8rem", color: "var(--text-muted)", paddingLeft: "26px" }}>
+                                                <Cpu size={14} style={{ color: "var(--primary-color)" }} />
+                                                <span>Active Model:</span>
+                                                <span style={{
+                                                    padding: "2px 8px",
+                                                    background: "rgba(37, 99, 235, 0.12)",
+                                                    color: "var(--primary-color)",
+                                                    borderRadius: "4px",
+                                                    fontFamily: "monospace",
+                                                    fontSize: "0.78rem",
+                                                    fontWeight: 700,
+                                                    border: "1px solid rgba(37, 99, 235, 0.2)"
+                                                }}>
+                                                    {currentModel}
+                                                </span>
+                                            </div>
+                                        )}
+                                    </div>
+                                )}
+                                {!scanning && scannedModel && (
+                                    <div style={{
+                                        marginTop: "12px",
+                                        padding: "9px 14px",
+                                        background: "rgba(16, 185, 129, 0.08)",
+                                        border: "1px solid rgba(16, 185, 129, 0.25)",
+                                        borderRadius: "8px",
+                                        fontSize: "0.825rem",
+                                        display: "flex",
+                                        alignItems: "center",
+                                        gap: "8px",
+                                        color: "#059669"
+                                    }}>
+                                        <CheckCircle2 size={16} />
+                                        <span style={{ fontWeight: 500 }}>Successfully extracted using model:</span>
+                                        <span style={{
+                                            padding: "2px 8px",
+                                            background: "rgba(16, 185, 129, 0.15)",
+                                            borderRadius: "4px",
+                                            fontFamily: "monospace",
+                                            fontSize: "0.78rem",
+                                            fontWeight: 700,
+                                            border: "1px solid rgba(16, 185, 129, 0.25)"
+                                        }}>
+                                            {scannedModel}
+                                        </span>
                                     </div>
                                 )}
                                 <input ref={fileRef} type="file" multiple accept=".png,.jpg,.jpeg,.webp,.pdf,image/png,image/jpeg,image/webp,application/pdf" style={{ display: "none" }} onChange={onFile} />
@@ -1074,7 +1286,7 @@ export default function BillsPage() {
                                     </div>
                                     <div>
                                         <label className="section-label">Date</label>
-                                        <input className="input-field" type="date" value={form.date || ""} onChange={(e) => setForm({ ...form, date: e.target.value })} />
+                                        <input className="input-field" type="date" value={form.date || ""} onClick={openNativeDatePicker} onChange={(e) => setForm({ ...form, date: e.target.value })} />
                                     </div>
                                     <div>
                                         <label className="section-label">Type</label>
@@ -1168,7 +1380,7 @@ export default function BillsPage() {
                                         <>
                                             <div>
                                                 <label className="section-label">Paid Date</label>
-                                                <input className="input-field" type="date" value={form.paidDate || ""} onChange={(e) => setForm({ ...form, paidDate: e.target.value })} />
+                                                <input className="input-field" type="date" value={form.paidDate || ""} onClick={openNativeDatePicker} onChange={(e) => setForm({ ...form, paidDate: e.target.value })} />
                                             </div>
                                             <div>
                                                 <label className="section-label">Paid Type</label>
@@ -1193,19 +1405,6 @@ export default function BillsPage() {
                             <div className="bill-section">
                                 <div className="section-header-row">
                                     <h3 className="bill-section-title">Products</h3>
-                                    <button
-                                        type="button"
-                                        className="btn-secondary"
-                                        onClick={() => {
-                                            const products = [...(form.products || []), { name: "", quantity: "", unit: "", price: "", hsn: "", category: "Trade" }];
-                                            setForm((current) => {
-                                                const updated = { ...current, products };
-                                                return { ...updated, ...recalc(updated, { autoRoundOff: true }) };
-                                            });
-                                        }}
-                                    >
-                                        Add Row
-                                    </button>
                                 </div>
                                 <div style={{ display: "grid", gap: "10px" }}>
                                     {(form.products || []).map((product, index) => (
@@ -1249,17 +1448,10 @@ export default function BillsPage() {
                                                 className="panel-icon-btn"
                                                 onClick={() => {
                                                     const products = (form.products || []).filter((_, row) => row !== index);
-                                                    const newGross = products.reduce((s, p) => s + parseNumericValue(p.quantity) * parseNumericValue(p.price), 0);
-                                                    const updatedTaxDetails = (form.taxDetails || []).map((t) => {
-                                                        const pct = parseNumericValue(t.taxPercentage);
-                                                        if (pct > 0) {
-                                                            return {
-                                                                ...t,
-                                                                taxAmount: toFormNumber(Number(((newGross * pct) / 100).toFixed(2)))
-                                                            };
-                                                        }
-                                                        return t;
-                                                    });
+                                                    const updatedTaxDetails = recalculateTaxDetails(
+                                                        form.taxDetails,
+                                                        getTaxableAmount(products, form.freightAndForwardingCharges),
+                                                    );
                                                     setForm((current) => {
                                                         const updated = { ...current, products, taxDetails: updatedTaxDetails };
                                                         return { ...updated, ...recalc(updated, { autoRoundOff: true }) };
@@ -1270,6 +1462,21 @@ export default function BillsPage() {
                                             </button>
                                         </div>
                                     ))}
+                                </div>
+                                <div style={{ marginTop: "12px", display: "flex", justifyContent: "flex-end" }}>
+                                    <button
+                                        type="button"
+                                        className="btn-secondary"
+                                        onClick={() => {
+                                            const products = [...(form.products || []), { name: "", quantity: "", unit: "", price: "", hsn: "", category: "Trade" }];
+                                            setForm((current) => {
+                                                const updated = { ...current, products };
+                                                return { ...updated, ...recalc(updated, { autoRoundOff: true }) };
+                                            });
+                                        }}
+                                    >
+                                        Add Row
+                                    </button>
                                 </div>
                             </div>
 

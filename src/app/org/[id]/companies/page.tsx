@@ -24,6 +24,7 @@ import {
 } from "@/utils/firebaseHelpers/companies";
 import { formatCurrencyINR } from "@/utils/formatters";
 import { escapeHtml, openPrintWindow } from "@/utils/print";
+import { openNativeDatePicker } from "@/utils/nativeDatePicker";
 
 const emptyCompany = { name: "", gst: "", address: "", phoneNumbers: "" };
 const emptyLedgerForm = {
@@ -1163,7 +1164,7 @@ export default function CompaniesPage() {
                             )}
                             {ledgerModalMode !== "openingBalance" && (
                                 <>
-                                    <input className="input-field" type="date" value={ledgerForm.date} onChange={(e) => setLedgerForm({ ...ledgerForm, date: e.target.value })} required />
+                                    <input className="input-field" type="date" value={ledgerForm.date} onClick={openNativeDatePicker} onChange={(e) => setLedgerForm({ ...ledgerForm, date: e.target.value })} required />
                                     <input className="input-field" placeholder="Bank" value={ledgerForm.bank} onChange={(e) => setLedgerForm({ ...ledgerForm, bank: e.target.value })} />
                                     {ledgerForm.gateway === "cheque" && <input className="input-field" placeholder="Cheque Number" value={ledgerForm.chequeNumber} onChange={(e) => setLedgerForm({ ...ledgerForm, chequeNumber: e.target.value })} />}
                                     <textarea className="input-field" placeholder="Note" value={ledgerForm.note} onChange={(e) => setLedgerForm({ ...ledgerForm, note: e.target.value })} />

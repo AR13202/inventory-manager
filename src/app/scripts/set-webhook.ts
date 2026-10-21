@@ -10,15 +10,15 @@
 import { config } from "dotenv";
 config({ path: ".env" });
 
-const BOT_TOKEN = process.env.NEXT_PUBLIC_TELEGRAM_BOT_TOKEN;
-const WEBHOOK_URL = process.env.NEXT_PUBLIC_APP_URL; // e.g. https://your-app.vercel.app
-const WEBHOOK_SECRET = process.env.NEXT_PUBLIC_TELEGRAM_WEBHOOK_SECRET; // optional
+const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const WEBHOOK_URL = process.env.APP_URL; // e.g. https://your-app.vercel.app
+const WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET; // optional
 
 if (!BOT_TOKEN || !WEBHOOK_URL) {
   console.log("BOT_TOKEN:", BOT_TOKEN);
   console.log("WEBHOOK_URL:", WEBHOOK_URL);
   console.log("WEBHOOK_SECRET:", WEBHOOK_SECRET);
-  console.error("Missing TELEGRAM_BOT_TOKEN or NEXT_PUBLIC_APP_URL env vars");
+  console.error("Missing TELEGRAM_BOT_TOKEN or APP_URL env vars");
   process.exit(1);
 }
 
